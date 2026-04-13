@@ -1,6 +1,6 @@
 const admin = require("firebase-admin");
 
-const serviceAccount = require("./anime-tracker-93e52-firebase-adminsdk-fbsvc-4cc405f350.json");
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -9,4 +9,3 @@ admin.initializeApp({
 const db = admin.firestore();
 
 module.exports = db;
-console.log("Firebase Connected");
