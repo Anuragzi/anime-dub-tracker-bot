@@ -7,12 +7,12 @@ const TelegramBot = require("node-telegram-bot-api");
 const token = process.env.BOT_TOKEN;
 const bot = new TelegramBot(token, { polling: true });
 
-// console.log("🚀 Bot is running");
+console.log("🚀 Bot is running");
 
-// ================= STATE STORAGE =================
+// ================= STATE =================
 const userState = new Map();
 
-// ================= ANILIST FUNCTION =================
+// ================= ANILIST API =================
 async function getAnimeInfo(search) {
   try {
     const query = `
@@ -44,11 +44,11 @@ async function getAnimeInfo(search) {
       score: anime.averageScore,
       synopsis: anime.description,
       image: anime.coverImage.large,
-      nextEpisode: anime.nextAiringEpisode?.episode || "N/A"
+      nextEpisode: anime.nextAiringEpisode?.episode || null
     };
 
   } catch (err) {
-    console.log("AniList error:", err.response?.data || err.message);
+    console.log(err.message);
     return null;
   }
 }
@@ -76,7 +76,6 @@ bot.onText(/\/start/, async (msg) => {
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
-
   if (!text) return;
 
   // ---------- TRACK ----------
@@ -93,11 +92,11 @@ bot.on("message", async (msg) => {
 
   // ---------- MY LIST ----------
   if (text === "📋 My List") {
-    const userRef = await db.collection("users").doc(String(chatId)).get();
-    const data = userRef.data();
+    const user = await db.collection("users").doc(String(chatId)).get();
+    const data = user.data();
 
     if (!data?.animeList?.length) {
-      return bot.sendMessage(chatId, "📭 Your list is empty");
+      return bot.sendMessage(chatId, "📭 No anime tracked yet");
     }
 
     const buttons = data.animeList.map(a => ([{
@@ -112,12 +111,12 @@ bot.on("message", async (msg) => {
 
   // ---------- UNTRACK ----------
   if (text === "❌ Untrack Anime") {
-    const userRef = await db.collection("users").doc(String(chatId)).get();
-    const data = userRef.data();
+    const user = await db.collection("users").doc(String(chatId)).get();
+    const data = user.data();
 
-    if (!data?.animeList || data.animeList.length === 0) {
+    if (!data?.animeList?.length) {
       return bot.sendMessage(chatId,
-        '❌ You aren’t tracking any anime currently!\nUse "📺 Track Anime" to start.'
+        '❌ You aren’t tracking any anime!\nUse Track button.'
       );
     }
 
@@ -148,21 +147,23 @@ bot.on("message", async (msg) => {
     const anime = text.trim();
 
     const info = await getAnimeInfo(anime);
-
     userState.delete(chatId);
 
     if (!info) {
       return bot.sendMessage(chatId,
-        "❌ No Anime Found🔴, Please Check Spelling!"
+        "❌ No Anime Found🔴 Please Check Spelling"
       );
     }
 
     await db.collection("users").doc(String(chatId)).set({
       chatId,
-      animeList: admin.firestore.FieldValue.arrayUnion(anime.toLowerCase())
+      animeList: admin.firestore.FieldValue.arrayUnion(anime.toLowerCase()),
+      [`progress.${anime.toLowerCase()}`]: {
+        lastEpisode: 0
+      }
     }, { merge: true });
 
-    return bot.sendMessage(chatId, `✅ Now tracking ${info.title}`);
+    return bot.sendMessage(chatId, `📌 Now tracking ${info.title}`);
   }
 
   // ---------- SEARCH INPUT ----------
@@ -170,12 +171,11 @@ bot.on("message", async (msg) => {
     const anime = text.trim();
 
     const info = await getAnimeInfo(anime);
-
     userState.delete(chatId);
 
     if (!info) {
       return bot.sendMessage(chatId,
-        "❌ No Anime Found🔴, Please Check Spelling!"
+        "❌ No Anime Found🔴 Please Check Spelling"
       );
     }
 
@@ -185,9 +185,17 @@ bot.on("message", async (msg) => {
         `⭐ Score: ${info.score}\n` +
         `📺 Episodes: ${info.episodes}\n` +
         `📡 Status: ${info.status}\n` +
-        `⏭️ Next EP: ${info.nextEpisode}\n\n` +
+        `⏭️ Next Episode: ${info.nextEpisode || "N/A"}\n\n` +
         `${info.synopsis?.slice(0, 200)}...`,
-      parse_mode: "Markdown"
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{
+            text: "📌 Track Anime",
+            callback_data: `track_${anime.toLowerCase()}`
+          }]
+        ]
+      }
     });
   }
 });
@@ -197,7 +205,25 @@ bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
   const data = query.data;
 
-  // UNTRACK SELECT
+  // ---------- TRACK ----------
+  if (data.startsWith("track_")) {
+    const anime = data.replace("track_", "");
+
+    const info = await getAnimeInfo(anime);
+
+    if (!info) {
+      return bot.sendMessage(chatId, "❌ Anime not found");
+    }
+
+    await db.collection("users").doc(String(chatId)).set({
+      chatId,
+      animeList: admin.firestore.FieldValue.arrayUnion(anime)
+    }, { merge: true });
+
+    return bot.sendMessage(chatId, `📌 Now tracking ${info.title}`);
+  }
+
+  // ---------- UNTRACK ----------
   if (data.startsWith("untrack_")) {
     const anime = data.replace("untrack_", "");
 
@@ -208,14 +234,14 @@ bot.on("callback_query", async (query) => {
     return bot.sendMessage(chatId, `❌ Untracked: ${anime}`);
   }
 
-  // MY LIST → SHOW INFO
+  // ---------- INFO ----------
   if (data.startsWith("info_")) {
     const anime = data.replace("info_", "");
 
     const info = await getAnimeInfo(anime);
 
     if (!info) {
-      return bot.sendMessage(chatId, "❌ Anime not found");
+      return bot.sendMessage(chatId, "❌ Not found");
     }
 
     return bot.sendPhoto(chatId, info.image, {
@@ -224,14 +250,39 @@ bot.on("callback_query", async (query) => {
         `⭐ Score: ${info.score}\n` +
         `📺 Episodes: ${info.episodes}\n` +
         `📡 Status: ${info.status}\n` +
-        `⏭️ Next EP: ${info.nextEpisode}\n\n` +
+        `⏭️ Next EP: ${info.nextEpisode || "N/A"}\n\n` +
         `${info.synopsis?.slice(0, 200)}...`,
       parse_mode: "Markdown"
     });
   }
 });
 
-// ================= CRON (FUTURE USE) =================
+// ================= AUTO EPISODE CHECK =================
 cron.schedule("0 * * * *", async () => {
- // console.log("⏳ Checking updates...");
+  console.log("🔔 Checking anime updates...");
+
+  const users = await db.collection("users").get();
+
+  users.forEach(async (doc) => {
+    const data = doc.data();
+    if (!data.animeList) return;
+
+    for (let anime of data.animeList) {
+      const info = await getAnimeInfo(anime);
+      if (!info?.nextEpisode) continue;
+
+      const last = data.progress?.[anime]?.lastEpisode || 0;
+
+      if (info.nextEpisode > last) {
+        await db.collection("users").doc(doc.id).set({
+          [`progress.${anime}.lastEpisode`]: info.nextEpisode
+        }, { merge: true });
+
+        bot.sendMessage(
+          data.chatId,
+          `🔔 New Episode Released!\n\n🎬 ${info.title}\n📺 Episode ${info.nextEpisode}`
+        );
+      }
+    }
+  });
 });
