@@ -7,7 +7,7 @@ const TelegramBot = require("node-telegram-bot-api");
 const token = process.env.BOT_TOKEN;
 const bot = new TelegramBot(token, { polling: true });
 
-console.log("🚀 Bot is running");
+// console.log("🚀 Bot is running");
 
 // ================= STATE STORAGE =================
 const userState = new Map();
@@ -233,5 +233,5 @@ bot.on("callback_query", async (query) => {
 
 // ================= CRON (FUTURE USE) =================
 cron.schedule("0 * * * *", async () => {
-  console.log("⏳ Checking updates...");
+ // console.log("⏳ Checking updates...");
 });
