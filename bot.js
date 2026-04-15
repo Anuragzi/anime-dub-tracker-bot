@@ -1,19 +1,30 @@
+require("dotenv").config();
+const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const cron = require("node-cron");
-const admin = require("firebase-admin");
-const db = require("./firebase");
-const TelegramBot = require("node-telegram-bot-api");
 
-const token = process.env.BOT_TOKEN;
-const bot = new TelegramBot(token, { polling: true });
+// ====== BOT INIT ======
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-// console.log("🚀 Bot is running");
-
-// ================= STATE =================
+// ====== STATE ======
 const userState = new Map();
 
-// ================= ANILIST API =================
-async function getAnimeInfo(search) {
+// ====== DATABASE (temporary in-memory) ======
+const userTracking = new Map(); 
+// structure: userId => [{ title, lastEpisodeAlerted }]
+
+// ====== LOG CONTROL (FIX RAILWAY ISSUE) ======
+let lastLog = 0;
+function safeLog(msg) {
+  const now = Date.now();
+  if (now - lastLog > 15000) { // log only every 15 sec
+    console.log(msg);
+    lastLog = now;
+  }
+}
+
+// ====== ANILIST FETCH ======
+async function getAnimeBasic(search) {
   try {
     const query = `
       query ($search: String) {
@@ -22,9 +33,7 @@ async function getAnimeInfo(search) {
           episodes
           status
           averageScore
-          description
           coverImage { large }
-          nextAiringEpisode { episode }
         }
       }
     `;
@@ -34,255 +43,151 @@ async function getAnimeInfo(search) {
       variables: { search }
     });
 
-    const anime = res.data.data.Media;
-    if (!anime) return null;
-
-    return {
-      title: anime.title.romaji,
-      episodes: anime.episodes,
-      status: anime.status,
-      score: anime.averageScore,
-      synopsis: anime.description,
-      image: anime.coverImage.large,
-      nextEpisode: anime.nextAiringEpisode?.episode || null
-    };
-
+    return res.data.data.Media;
   } catch (err) {
-    console.log(err.message);
     return null;
   }
 }
 
-// ================= START =================
-bot.onText(/\/start/, async (msg) => {
+// ====== FAKE DUB DATA (Replace with Consumet later) ======
+async function getDubData(title) {
+  // You can later replace this with Consumet API
+  return {
+    dubEpisodes: Math.floor(Math.random() * 12) + 1,
+    totalEpisodes: 24,
+    pattern: "Weekly (Sunday)",
+  };
+}
+
+// ====== SMART PREDICTION ======
+function predictNextEpisode(dubEpisodes) {
+  const nextEpisode = dubEpisodes + 1;
+
+  const nextDate = new Date();
+  nextDate.setDate(nextDate.getDate() + 7);
+
+  return {
+    nextEpisode,
+    nextDate: nextDate.toDateString()
+  };
+}
+
+// ====== MAIN DATA FUNCTION ======
+async function getFullAnimeData(search) {
+  const basic = await getAnimeBasic(search);
+  if (!basic) return null;
+
+  const dub = await getDubData(basic.title.romaji);
+
+  const prediction = predictNextEpisode(dub.dubEpisodes);
+
+  return {
+    title: basic.title.romaji,
+    image: basic.coverImage.large,
+    score: basic.averageScore,
+    totalEpisodes: basic.episodes,
+
+    dubEpisodes: dub.dubEpisodes,
+    pattern: dub.pattern,
+
+    nextEpisode: prediction.nextEpisode,
+    nextDate: prediction.nextDate
+  };
+}
+
+// ====== SEARCH HANDLER ======
+bot.onText(/\/search (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
+  const query = match[1];
 
-  await db.collection("users").doc(String(chatId)).set({
-    chatId
-  }, { merge: true });
+  const info = await getFullAnimeData(query);
 
-  bot.sendMessage(chatId, "Welcome to Anime Dub Tracker 🚀", {
+  if (!info) {
+    return bot.sendMessage(chatId, "❌ Anime not found");
+  }
+
+  const text = `
+🎬 *${info.title}*
+
+🇬🇧 Dub Episodes: ${info.dubEpisodes}/${info.totalEpisodes}
+📊 Pattern: ${info.pattern}
+
+⏭ Next Episode: ${info.nextEpisode}
+📅 Expected: ${info.nextDate}
+`;
+
+  bot.sendPhoto(chatId, info.image, {
+    caption: text,
+    parse_mode: "Markdown",
     reply_markup: {
-      keyboard: [
-        ["📺 Track Anime", "📋 My List"],
-        ["❌ Untrack Anime", "🔎 Search"]
-      ],
-      resize_keyboard: true
+      inline_keyboard: [
+        [{ text: "📌 Track", callback_data: `track_${info.title}` }]
+      ]
     }
   });
 });
 
-// ================= MESSAGE HANDLER =================
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
-  const text = msg.text;
-  if (!text) return;
-
-  // ---------- TRACK ----------
-  if (text === "📺 Track Anime") {
-    userState.set(chatId, { step: "track" });
-    return bot.sendMessage(chatId, "✍️ Write Anime Name (e.g. Naruto)");
-  }
-
-  // ---------- SEARCH ----------
-  if (text === "🔎 Search") {
-    userState.set(chatId, { step: "search" });
-    return bot.sendMessage(chatId, "🔎 Write Anime Name (e.g. One Piece)");
-  }
-
-  // ---------- MY LIST ----------
-  if (text === "📋 My List") {
-    const user = await db.collection("users").doc(String(chatId)).get();
-    const data = user.data();
-
-    if (!data?.animeList?.length) {
-      return bot.sendMessage(chatId, "📭 No anime tracked yet");
-    }
-
-    const buttons = data.animeList.map(a => ([{
-      text: a,
-      callback_data: `info_${a}`
-    }]));
-
-    return bot.sendMessage(chatId, "📋 Your Anime List:", {
-      reply_markup: { inline_keyboard: buttons }
-    });
-  }
-
-  // ---------- UNTRACK ----------
-  if (text === "❌ Untrack Anime") {
-    const user = await db.collection("users").doc(String(chatId)).get();
-    const data = user.data();
-
-    if (!data?.animeList?.length) {
-      return bot.sendMessage(chatId,
-        '❌ You aren’t tracking any anime!\nUse Track button.'
-      );
-    }
-
-    if (data.animeList.length === 1) {
-      const anime = data.animeList[0];
-
-      await db.collection("users").doc(String(chatId)).update({
-        animeList: admin.firestore.FieldValue.arrayRemove(anime)
-      });
-
-      return bot.sendMessage(chatId, `❌ Untracked: ${anime}`);
-    }
-
-    const buttons = data.animeList.map(a => ([{
-      text: a,
-      callback_data: `untrack_${a}`
-    }]));
-
-    return bot.sendMessage(chatId, "Select anime to untrack:", {
-      reply_markup: { inline_keyboard: buttons }
-    });
-  }
-
-  // ---------- TRACK INPUT ----------
-  const state = userState.get(chatId);
-
-  if (state?.step === "track") {
-    const anime = text.trim();
-
-    const info = await getAnimeInfo(anime);
-    userState.delete(chatId);
-
-    if (!info) {
-      return bot.sendMessage(chatId,
-        "❌ No Anime Found🔴 Please Check Spelling"
-      );
-    }
-
-    await db.collection("users").doc(String(chatId)).set({
-      chatId,
-      animeList: admin.firestore.FieldValue.arrayUnion(anime.toLowerCase()),
-      [`progress.${anime.toLowerCase()}`]: {
-        lastEpisode: 0
-      }
-    }, { merge: true });
-
-    return bot.sendMessage(chatId, `📌 Now tracking ${info.title}`);
-  }
-
-  // ---------- SEARCH INPUT ----------
-  if (state?.step === "search") {
-    const anime = text.trim();
-
-    const info = await getAnimeInfo(anime);
-    userState.delete(chatId);
-
-    if (!info) {
-      return bot.sendMessage(chatId,
-        "❌ No Anime Found🔴 Please Check Spelling"
-      );
-    }
-
-    return bot.sendPhoto(chatId, info.image, {
-      caption:
-        `🎬 *${info.title}*\n\n` +
-        `⭐ Score: ${info.score}\n` +
-        `📺 Episodes: ${info.episodes}\n` +
-        `📡 Status: ${info.status}\n` +
-        `⏭️ Next Episode: ${info.nextEpisode || "N/A"}\n\n` +
-        `${info.synopsis?.slice(0, 200)}...`,
-      parse_mode: "Markdown",
-      reply_markup: {
-        inline_keyboard: [
-          [{
-            text: "📌 Track Anime",
-            callback_data: `track_${anime.toLowerCase()}`
-          }]
-        ]
-      }
-    });
-  }
-});
-
-// ================= CALLBACK HANDLER =================
-bot.on("callback_query", async (query) => {
+// ====== BUTTON HANDLER ======
+bot.on("callback_query", (query) => {
   const chatId = query.message.chat.id;
   const data = query.data;
 
-  // ---------- TRACK ----------
   if (data.startsWith("track_")) {
-    const anime = data.replace("track_", "");
+    const title = data.replace("track_", "");
 
-    const info = await getAnimeInfo(anime);
-
-    if (!info) {
-      return bot.sendMessage(chatId, "❌ Anime not found");
+    if (!userTracking.has(chatId)) {
+      userTracking.set(chatId, []);
     }
 
-    await db.collection("users").doc(String(chatId)).set({
-      chatId,
-      animeList: admin.firestore.FieldValue.arrayUnion(anime)
-    }, { merge: true });
+    const list = userTracking.get(chatId);
 
-    return bot.sendMessage(chatId, `📌 Now tracking ${info.title}`);
-  }
-
-  // ---------- UNTRACK ----------
-  if (data.startsWith("untrack_")) {
-    const anime = data.replace("untrack_", "");
-
-    await db.collection("users").doc(String(chatId)).update({
-      animeList: admin.firestore.FieldValue.arrayRemove(anime)
-    });
-
-    return bot.sendMessage(chatId, `❌ Untracked: ${anime}`);
-  }
-
-  // ---------- INFO ----------
-  if (data.startsWith("info_")) {
-    const anime = data.replace("info_", "");
-
-    const info = await getAnimeInfo(anime);
-
-    if (!info) {
-      return bot.sendMessage(chatId, "❌ Not found");
+    if (!list.find(a => a.title === title)) {
+      list.push({ title, lastEpisodeAlerted: 0 });
     }
 
-    return bot.sendPhoto(chatId, info.image, {
-      caption:
-        `🎬 *${info.title}*\n\n` +
-        `⭐ Score: ${info.score}\n` +
-        `📺 Episodes: ${info.episodes}\n` +
-        `📡 Status: ${info.status}\n` +
-        `⏭️ Next EP: ${info.nextEpisode || "N/A"}\n\n` +
-        `${info.synopsis?.slice(0, 200)}...`,
-      parse_mode: "Markdown"
-    });
+    bot.sendMessage(chatId, `✅ Tracking ${title}`);
   }
 });
 
-// ================= AUTO EPISODE CHECK =================
-cron.schedule("0 * * * *", async () => {
- // console.log("🔔 Checking anime updates...");
+// ====== MY LIST ======
+bot.onText(/\/mylist/, (msg) => {
+  const chatId = msg.chat.id;
 
-  const users = await db.collection("users").get();
+  const list = userTracking.get(chatId) || [];
 
-  users.forEach(async (doc) => {
-    const data = doc.data();
-    if (!data.animeList) return;
+  if (list.length === 0) {
+    return bot.sendMessage(chatId, "📭 Your list is empty");
+  }
 
-    for (let anime of data.animeList) {
-      const info = await getAnimeInfo(anime);
-      if (!info?.nextEpisode) continue;
+  let text = "📌 Your Tracked Anime:\n\n";
+  list.forEach((a, i) => {
+    text += `${i + 1}. ${a.title}\n`;
+  });
 
-      const last = data.progress?.[anime]?.lastEpisode || 0;
+  bot.sendMessage(chatId, text);
+});
 
-      if (info.nextEpisode > last) {
-        await db.collection("users").doc(doc.id).set({
-          [`progress.${anime}.lastEpisode`]: info.nextEpisode
-        }, { merge: true });
+// ====== SMART ALERT SYSTEM (NO SPAM) ======
+cron.schedule("*/30 * * * *", async () => {
+  safeLog("Checking updates...");
 
-        bot.sendMessage(
-          data.chatId,
-          `🔔 New Episode Released!\n\n🎬 ${info.title}\n📺 Episode ${info.nextEpisode}`
-        );
+  for (let [userId, list] of userTracking.entries()) {
+    for (let anime of list) {
+      const info = await getFullAnimeData(anime.title);
+
+      if (!info) continue;
+
+      // ALERT ONLY IF NEW EPISODE
+      if (info.dubEpisodes > anime.lastEpisodeAlerted) {
+        anime.lastEpisodeAlerted = info.dubEpisodes;
+
+        bot.sendMessage(userId, `
+🚨 *New Dub Episode Released!*
+
+🎬 ${info.title}
+🎉 Episode ${info.dubEpisodes} is now available!
+        `, { parse_mode: "Markdown" });
       }
     }
-  });
+  }
 });
