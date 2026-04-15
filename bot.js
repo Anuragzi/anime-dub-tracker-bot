@@ -1,3 +1,7 @@
+// ====== LOAD ENV FIRST (IMPORTANT) ======
+require("dotenv").config();
+
+// ====== EXPRESS (PREVENT RAILWAY CRASH) ======
 const express = require("express");
 const app = express();
 
@@ -6,34 +10,36 @@ app.get("/", (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Web server running"));
+app.listen(PORT, () => console.log("🌐 Web server running"));
 
-require("dotenv").config();
+// ====== IMPORTS ======
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const cron = require("node-cron");
 
+// ====== TOKEN CHECK ======
+if (!process.env.BOT_TOKEN) {
+  console.error("❌ BOT_TOKEN missing!");
+  process.exit(1);
+}
+
 // ====== BOT INIT ======
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-// ====== STATE ======
-const userState = new Map();
+// ====== MEMORY DB ======
+const userTracking = new Map();
 
-// ====== DATABASE (temporary in-memory) ======
-const userTracking = new Map(); 
-// structure: userId => [{ title, lastEpisodeAlerted }]
-
-// ====== LOG CONTROL (FIX RAILWAY ISSUE) ======
+// ====== SAFE LOG (FIX LOG SPAM) ======
 let lastLog = 0;
 function safeLog(msg) {
   const now = Date.now();
-  if (now - lastLog > 15000) { // log only every 15 sec
+  if (now - lastLog > 15000) {
     console.log(msg);
     lastLog = now;
   }
 }
 
-// ====== ANILIST FETCH ======
+// ====== ANILIST API ======
 async function getAnimeBasic(search) {
   try {
     const query = `
@@ -41,7 +47,6 @@ async function getAnimeBasic(search) {
         Media(search: $search, type: ANIME) {
           title { romaji }
           episodes
-          status
           averageScore
           coverImage { large }
         }
@@ -54,22 +59,20 @@ async function getAnimeBasic(search) {
     });
 
     return res.data.data.Media;
-  } catch (err) {
+  } catch {
     return null;
   }
 }
 
-// ====== FAKE DUB DATA (Replace with Consumet later) ======
-async function getDubData(title) {
-  // You can later replace this with Consumet API
+// ====== TEMP DUB DATA ======
+async function getDubData() {
   return {
     dubEpisodes: Math.floor(Math.random() * 12) + 1,
-    totalEpisodes: 24,
-    pattern: "Weekly (Sunday)",
+    pattern: "Weekly (Sunday)"
   };
 }
 
-// ====== SMART PREDICTION ======
+// ====== PREDICTION ======
 function predictNextEpisode(dubEpisodes) {
   const nextEpisode = dubEpisodes + 1;
 
@@ -82,19 +85,17 @@ function predictNextEpisode(dubEpisodes) {
   };
 }
 
-// ====== MAIN DATA FUNCTION ======
+// ====== MAIN DATA ======
 async function getFullAnimeData(search) {
   const basic = await getAnimeBasic(search);
   if (!basic) return null;
 
-  const dub = await getDubData(basic.title.romaji);
-
+  const dub = await getDubData();
   const prediction = predictNextEpisode(dub.dubEpisodes);
 
   return {
     title: basic.title.romaji,
     image: basic.coverImage.large,
-    score: basic.averageScore,
     totalEpisodes: basic.episodes,
 
     dubEpisodes: dub.dubEpisodes,
@@ -105,7 +106,7 @@ async function getFullAnimeData(search) {
   };
 }
 
-// ====== SEARCH HANDLER ======
+// ====== SEARCH ======
 bot.onText(/\/search (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const query = match[1];
@@ -137,7 +138,7 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
   });
 });
 
-// ====== BUTTON HANDLER ======
+// ====== TRACK BUTTON ======
 bot.on("callback_query", (query) => {
   const chatId = query.message.chat.id;
   const data = query.data;
@@ -162,7 +163,6 @@ bot.on("callback_query", (query) => {
 // ====== MY LIST ======
 bot.onText(/\/mylist/, (msg) => {
   const chatId = msg.chat.id;
-
   const list = userTracking.get(chatId) || [];
 
   if (list.length === 0) {
@@ -177,9 +177,9 @@ bot.onText(/\/mylist/, (msg) => {
   bot.sendMessage(chatId, text);
 });
 
-// ====== SMART ALERT SYSTEM (NO SPAM) ======
+// ====== SMART ALERT (NO SPAM) ======
 cron.schedule("*/30 * * * *", async () => {
-  safeLog("Checking updates...");
+  safeLog("🔍 Checking updates...");
 
   for (let [userId, list] of userTracking.entries()) {
     for (let anime of list) {
@@ -187,7 +187,6 @@ cron.schedule("*/30 * * * *", async () => {
 
       if (!info) continue;
 
-      // ALERT ONLY IF NEW EPISODE
       if (info.dubEpisodes > anime.lastEpisodeAlerted) {
         anime.lastEpisodeAlerted = info.dubEpisodes;
 
