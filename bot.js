@@ -1,8 +1,14 @@
 // ============================================================
-// ====== ANIME DUB TRACKER BOT — bot.js (FULLY FIXED) =======
+// ====== ANIME DUB TRACKER BOT — bot.js (FULL REWRITE) ======
+// ============================================================
+// KEY CHANGES FROM PREVIOUS VERSION:
+//  - Removed persistent bottom keyboard buttons entirely
+//  - Real dub episode count from AnimeSchedule.net API v3
+//  - Removed all "next episode prediction" (not needed)
+//  - Alerts fire the moment a new dubbed episode is detected
+//  - All previous bugs (#1–#9) remain fixed
 // ============================================================
 
-// ====== LOAD ENV ======
 require("dotenv").config();
 
 // ====== EXPRESS (RAILWAY KEEP-ALIVE) ======
@@ -20,7 +26,7 @@ const cron = require("node-cron");
 const admin = require("firebase-admin");
 
 // ============================================================
-// ====== FIREBASE INIT (merged from your firebase.js) ========
+// ====== FIREBASE INIT =======================================
 // ============================================================
 let serviceAccount;
 try {
@@ -30,10 +36,7 @@ try {
   process.exit(1);
 }
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 console.log("✅ Firebase connected");
 
@@ -45,11 +48,17 @@ if (!process.env.BOT_TOKEN) {
   process.exit(1);
 }
 
+// NOTE: Make sure ANIMESCHEDULE_KEY is set in Railway env vars
+// Get your free API key at: https://animeschedule.net/users/<yourname>/settings/api
+if (!process.env.ANIMESCHEDULE_KEY) {
+  console.warn("⚠️  ANIMESCHEDULE_KEY not set — dub counts will be estimated");
+}
+
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 bot.getMe().then((me) => console.log(`🤖 Bot running as @${me.username}`));
 
 // ============================================================
-// ====== SAFE LOG (prevents Railway log rate limits) =========
+// ====== SAFE LOG ============================================
 // ============================================================
 let lastLog = 0;
 function safeLog(msg) {
@@ -62,15 +71,12 @@ function safeLog(msg) {
 // ============================================================
 // ====== UTILS ===============================================
 // ============================================================
-
-// Strips HTML tags from AniList synopsis
 function cleanText(text) {
   if (!text) return "No synopsis available.";
   return text.replace(/<[^>]*>/g, "").trim().slice(0, 350);
 }
 
-// Escapes MarkdownV2 special characters for Telegram
-// FIX Bug #8: Prevents Telegram parse errors on special chars
+// Escapes all MarkdownV2 special characters for Telegram
 function escMd(text) {
   if (text === null || text === undefined) return "";
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
@@ -89,9 +95,7 @@ async function getAnimeBySearch(search) {
           episodes
           status
           description
-          averageScore
           coverImage { large }
-          nextAiringEpisode { airingAt episode }
         }
       }`;
 
@@ -109,8 +113,6 @@ async function getAnimeBySearch(search) {
 
 // ============================================================
 // ====== ANILIST — FETCH BY NUMERIC ID =======================
-// FIX Bug #1 & #6: Old code passed numeric ID to a name-based
-// search query. Now uses a proper id-based AniList query.
 // ============================================================
 async function getAnimeById(anilistId) {
   try {
@@ -122,9 +124,7 @@ async function getAnimeById(anilistId) {
           episodes
           status
           description
-          averageScore
           coverImage { large }
-          nextAiringEpisode { airingAt episode }
         }
       }`;
 
@@ -141,93 +141,76 @@ async function getAnimeById(anilistId) {
 }
 
 // ============================================================
-// ====== CONSUMET — REAL DUB DATA ============================
-// Merged from your animeService.js. Falls back gracefully.
+// ====== ANIMESCHEDULE.NET — REAL DUB EPISODE COUNT ==========
+// Docs: https://animeschedule.net/api/v3/documentation/anime
+//
+// This is the ONLY place dub counts come from.
+// We query by AniList ID so it matches exactly.
+// The API returns `dubEpisodes` — the actual number of
+// English dubbed episodes released so far.
 // ============================================================
-async function getConsumetDubData(title) {
+async function getRealDubCount(anilistId) {
+  if (!process.env.ANIMESCHEDULE_KEY) return null;
+
   try {
     const res = await axios.get(
-      `https://api.consumet.org/anime/gogoanime/${encodeURIComponent(title + " dub")}`,
-      { timeout: 10000 }
+      `https://animeschedule.net/api/v3/anime`,
+      {
+        params: {
+          "anilist-ids": parseInt(anilistId),
+        },
+        headers: {
+          Authorization: `Bearer ${process.env.ANIMESCHEDULE_KEY}`,
+        },
+        timeout: 10000,
+      }
     );
-    const results = res.data?.results;
+
+    const results = res.data;
     if (!results || results.length === 0) return null;
 
-    // Prefer results explicitly labelled as dubbed
-    const dubbed = results.find((r) =>
-      r.title?.toLowerCase().includes("dub")
-    );
-    return dubbed || null;
-  } catch {
-    // Consumet is often rate-limited or down — fail silently
+    const anime = results[0];
+
+    // dubEpisodes = how many English dub episodes have been released
+    // episodeCount = total episodes of the show
+    return {
+      dubEpisodes: anime.dubEpisodes ?? null,
+      episodeCount: anime.episodeCount ?? null,
+      route: anime.route ?? null,   // slug for animeschedule.net link
+    };
+  } catch (err) {
+    console.error("AnimeSchedule API error:", err.message);
     return null;
   }
 }
 
 // ============================================================
-// ====== DUB INFO (Consumet first, fallback estimate) ========
-// ============================================================
-async function getDubInfo(anime) {
-  const title = anime.title?.english || anime.title?.romaji || "";
-  const totalEpisodes = anime.episodes || 12;
-
-  const conData = await getConsumetDubData(title);
-
-  if (conData?.episodeCount) {
-    return {
-      dubEpisodes: conData.episodeCount,
-      pattern: "Weekly (Consumet live data)",
-    };
-  }
-
-  // Fallback: safe placeholder
-  return {
-    dubEpisodes: Math.min(12, totalEpisodes),
-    pattern: "Weekly (estimated)",
-  };
-}
-
-// ============================================================
-// ====== PREDICTION ENGINE ===================================
-// ============================================================
-function predictNext(anime, dubEpisodes) {
-  const nextEpisode = dubEpisodes + 1;
-
-  // Use AniList's real next airing timestamp if available
-  if (anime.nextAiringEpisode?.airingAt) {
-    const d = new Date(anime.nextAiringEpisode.airingAt * 1000);
-    return { nextEpisode, nextDate: d.toDateString() };
-  }
-
-  // Fallback: +7 days
-  const nextDate = new Date();
-  nextDate.setDate(nextDate.getDate() + 7);
-  return { nextEpisode, nextDate: nextDate.toDateString() };
-}
-
-// ============================================================
 // ====== BUILD FULL ANIME OBJECT =============================
+// dubEpisodes comes from AnimeSchedule (real data).
+// Falls back to null so we show "Unknown" instead of a lie.
 // ============================================================
-function buildAnimeData(anime, dub) {
-  const next = predictNext(anime, dub.dubEpisodes);
+async function buildAnimeData(anime) {
+  const schedData = await getRealDubCount(anime.id);
+
+  const totalEpisodes = anime.episodes || schedData?.episodeCount || null;
+  const dubEpisodes = schedData?.dubEpisodes ?? null; // null = unknown
+
   return {
-    id: anime.id,                                       // always a NUMBER
+    id: anime.id,
     title: anime.title.english || anime.title.romaji,
     image: anime.coverImage?.large || null,
-    episodes: anime.episodes || "?",
+    episodes: totalEpisodes,
     status: anime.status || "UNKNOWN",
     synopsis: cleanText(anime.description),
-    dubEpisodes: dub.dubEpisodes,
-    pattern: dub.pattern,
-    nextEpisode: next.nextEpisode,
-    nextDate: next.nextDate,
+    dubEpisodes,                           // REAL count or null
+    dubSource: schedData ? "AnimeSchedule.net" : "Unavailable",
+    scheduleRoute: schedData?.route || null,
   };
 }
 
 // ============================================================
 // ====== FIREBASE HELPERS ====================================
 // ============================================================
-
 async function getTrackedList(userId) {
   try {
     const doc = await db.collection("users").doc(String(userId)).get();
@@ -250,19 +233,16 @@ async function saveTrackedList(userId, list) {
   }
 }
 
-// FIX Bug #5: Now stores title + dubEpisodes alongside id.
-// Old code only stored { id, lastEpisodeAlerted: 0 } which
-// made /mylist unable to display anything useful.
-async function trackAnime(userId, animeData) {
+async function trackAnime(userId, data) {
   const list = await getTrackedList(userId);
-  const exists = list.find((a) => a.id === animeData.id);
-  if (exists) return false; // already tracked
+  const exists = list.find((a) => a.id === data.id);
+  if (exists) return false;
 
   list.push({
-    id: animeData.id,                           // NUMBER
-    title: animeData.title,                     // stored for /mylist display
-    dubEpisodes: animeData.dubEpisodes,         // stored for alert diffing
-    lastEpisodeAlerted: animeData.dubEpisodes,  // start from current, not 0
+    id: data.id,                                  // number
+    title: data.title,
+    dubEpisodes: data.dubEpisodes,
+    lastEpisodeAlerted: data.dubEpisodes ?? 0,    // start from NOW, not 0
   });
 
   await saveTrackedList(userId, list);
@@ -286,45 +266,90 @@ async function updateLastAlerted(userId, animeId, episode) {
 }
 
 // ============================================================
-// ====== FORMAT SEARCH MESSAGE ===============================
+// ====== FORMAT MESSAGE ======================================
+// Removed: Release Pattern, Next Episode, Est. Date
+// Added: accurate dub count with data source label
 // ============================================================
 function formatAnimeMessage(data) {
-  const statusEmoji = {
-    FINISHED: "✅",
-    RELEASING: "📡",
-    NOT_YET_RELEASED: "🔜",
-    CANCELLED: "❌",
+  const statusLabel = {
+    FINISHED: "Finished ✅",
+    RELEASING: "Currently Airing 📡",
+    NOT_YET_RELEASED: "Not Yet Released 🔜",
+    CANCELLED: "Cancelled ❌",
   };
-  const statusIcon = statusEmoji[data.status] || "❓";
+
+  const dubLine =
+    data.dubEpisodes !== null
+      ? `*${escMd(data.dubEpisodes)}* episodes dubbed so far`
+      : `Unknown \\(data unavailable\\)`;
+
+  const totalLine =
+    data.episodes
+      ? `*${escMd(data.episodes)}* episodes total`
+      : "Unknown";
 
   return (
     `🎬 *${escMd(data.title)}*\n\n` +
-    `📺 Total Episodes: *${escMd(data.episodes)}* ${statusIcon}\n` +
-    `🇬🇧 Dubbed Episodes: *${escMd(data.dubEpisodes)}*\n` +
-    `📊 Release Pattern: ${escMd(data.pattern)}\n\n` +
-    `⏭ Next Dub Ep: *Ep ${escMd(data.nextEpisode)}*\n` +
-    `📅 Est\\. Date: ${escMd(data.nextDate)}\n\n` +
+    `📺 Total Episodes: ${totalLine}\n` +
+    `📊 Status: ${escMd(statusLabel[data.status] || data.status)}\n\n` +
+    `🇬🇧 *English Dub: ${dubLine}*\n` +
+    `🔎 Source: ${escMd(data.dubSource)}\n\n` +
     `📖 *Synopsis:*\n${escMd(data.synopsis)}`
   );
 }
 
 // ============================================================
+// ====== BUILD /mylist MESSAGE + KEYBOARD ====================
+// ============================================================
+function buildMyListMessage(list) {
+  let text = `📋 *Your Tracked Anime \\(${escMd(list.length)}\\):*\n\n`;
+
+  list.forEach((item, i) => {
+    const dub =
+      item.dubEpisodes !== null && item.dubEpisodes !== undefined
+        ? `Ep *${escMd(item.dubEpisodes)}* dubbed`
+        : "Dub count unknown";
+    text += `${i + 1}\\. *${escMd(item.title)}* — 🇬🇧 ${dub}\n`;
+  });
+
+  text += `\n_Tap below to untrack an anime_`;
+
+  const keyboard = list.map((item) => [
+    {
+      text: `🗑 Untrack: ${item.title}`,
+      callback_data: `untrack_${item.id}`,
+    },
+  ]);
+
+  return { text, keyboard };
+}
+
+// ============================================================
 // ====== /start & /help ======================================
+// NOTE: No reply_markup keyboard here — removes bottom buttons
 // ============================================================
 const welcomeText =
   `👋 *Welcome to Anime Dub Tracker\\!*\n\n` +
-  `Track English dubbed episodes and get notified automatically\\.\n\n` +
+  `I track *real* English dub episode counts and alert you when new dubbed episodes drop\\.\n\n` +
   `*Commands:*\n` +
   `🔍 /search \\<name\\> — Search for an anime\n` +
   `📋 /mylist — View and manage your tracked anime\n` +
-  `❓ /help — Show this message`;
+  `❓ /help — Show this message\n\n` +
+  `_Dub data powered by AnimeSchedule\\.net_`;
 
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, welcomeText, { parse_mode: "MarkdownV2" });
+  // reply_markup: { remove_keyboard: true } removes any old sticky keyboard
+  bot.sendMessage(msg.chat.id, welcomeText, {
+    parse_mode: "MarkdownV2",
+    reply_markup: { remove_keyboard: true },
+  });
 });
 
 bot.onText(/\/help/, (msg) => {
-  bot.sendMessage(msg.chat.id, welcomeText, { parse_mode: "MarkdownV2" });
+  bot.sendMessage(msg.chat.id, welcomeText, {
+    parse_mode: "MarkdownV2",
+    reply_markup: { remove_keyboard: true },
+  });
 });
 
 // ============================================================
@@ -334,7 +359,6 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const query = match[1].trim();
 
-  // Send "Searching..." placeholder
   const placeholder = await bot.sendMessage(
     chatId,
     `🔍 Searching for *${escMd(query)}*\\.\\.\\.`,
@@ -342,37 +366,38 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
   );
 
   const anime = await getAnimeBySearch(query);
-
-  // Always clean up placeholder
   await bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
 
   if (!anime) {
     return bot.sendMessage(
       chatId,
-      "❌ Anime not found\\. Try a different name\\.",
+      "❌ Anime not found\\. Try a different spelling\\.",
       { parse_mode: "MarkdownV2" }
     );
   }
 
-  const dub = await getDubInfo(anime);
-  const data = buildAnimeData(anime, dub);
+  const data = await buildAnimeData(anime);
   const caption = formatAnimeMessage(data);
 
+  // Only inline button — no sticky keyboard
   const keyboard = {
     inline_keyboard: [
       [{ text: "📌 Track this anime", callback_data: `track_${data.id}` }],
     ],
   };
 
-  // FIX Bug #8: try/catch on sendPhoto — falls back to text if image fails
   try {
-    await bot.sendPhoto(chatId, data.image, {
-      caption,
-      parse_mode: "MarkdownV2",
-      reply_markup: keyboard,
-    });
-  } catch (err) {
-    console.error("sendPhoto failed, falling back to text:", err.message);
+    if (data.image) {
+      await bot.sendPhoto(chatId, data.image, {
+        caption,
+        parse_mode: "MarkdownV2",
+        reply_markup: keyboard,
+      });
+    } else {
+      throw new Error("No image");
+    }
+  } catch {
+    // Fallback: text only if image fails
     await bot.sendMessage(chatId, caption, {
       parse_mode: "MarkdownV2",
       reply_markup: keyboard,
@@ -382,9 +407,6 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
 
 // ============================================================
 // ====== /mylist =============================================
-// FIX Bug #1: Old code called getAnime(item.id) which used a
-// name-based search with a numeric ID — always returned null.
-// Now reads stored title/dubEpisodes directly from Firestore.
 // ============================================================
 bot.onText(/\/mylist/, async (msg) => {
   const chatId = msg.chat.id;
@@ -400,20 +422,7 @@ bot.onText(/\/mylist/, async (msg) => {
     );
   }
 
-  // Build message text
-  let text = `📋 *Your Tracked Anime \\(${escMd(list.length)}\\):*\n\n`;
-  list.forEach((item, i) => {
-    text += `${i + 1}\\. *${escMd(item.title)}* — 🇬🇧 Ep *${escMd(item.dubEpisodes)}*\n`;
-  });
-  text += `\n_Tap a button below to untrack_`;
-
-  // One untrack button per anime
-  const keyboard = list.map((item) => [
-    {
-      text: `🗑 Untrack: ${item.title}`,
-      callback_data: `untrack_${item.id}`,
-    },
-  ]);
+  const { text, keyboard } = buildMyListMessage(list);
 
   bot.sendMessage(chatId, text, {
     parse_mode: "MarkdownV2",
@@ -423,9 +432,6 @@ bot.onText(/\/mylist/, async (msg) => {
 
 // ============================================================
 // ====== CALLBACK QUERY HANDLER ==============================
-// FIX Bug #2: ID now always parsed to INT consistently
-// FIX Bug #3: Untrack button fully implemented
-// FIX Bug #7: answerCallbackQuery always called in every path
 // ============================================================
 bot.on("callback_query", async (q) => {
   const chatId = q.message.chat.id;
@@ -434,9 +440,9 @@ bot.on("callback_query", async (q) => {
 
   // ── TRACK ──────────────────────────────────────────────────
   if (data.startsWith("track_")) {
-    const animeId = parseInt(data.split("_")[1]); // FIX Bug #2: always INT
+    const animeId = parseInt(data.split("_")[1]);
 
-    const anime = await getAnimeById(animeId);   // FIX Bug #2: use ID query
+    const anime = await getAnimeById(animeId);
     if (!anime) {
       await bot.answerCallbackQuery(q.id, {
         text: "❌ Could not fetch anime data. Try again.",
@@ -445,18 +451,16 @@ bot.on("callback_query", async (q) => {
       return;
     }
 
-    const dub = await getDubInfo(anime);
-    const animeData = buildAnimeData(anime, dub);
-
-    const added = await trackAnime(userId, animeData); // FIX Bug #5: stores full data
+    const animeData = await buildAnimeData(anime);
+    const added = await trackAnime(userId, animeData);
 
     if (added) {
       await bot.answerCallbackQuery(q.id, {
-        text: `✅ "${animeData.title}" added to your list!`,
+        text: `✅ "${animeData.title}" is now being tracked!`,
         show_alert: true,
       });
 
-      // Replace "Track" button with "✅ Tracked!" so user sees confirmation
+      // Swap Track button → ✅ Tracked
       try {
         await bot.editMessageReplyMarkup(
           {
@@ -481,15 +485,13 @@ bot.on("callback_query", async (q) => {
     const animeId = parseInt(data.split("_")[1]);
 
     await untrackAnime(userId, animeId);
-
     await bot.answerCallbackQuery(q.id, {
       text: "🗑 Removed from your list.",
       show_alert: false,
     });
 
-    // Rebuild /mylist message in-place
+    // Rebuild list message in-place
     const newList = await getTrackedList(userId);
-
     try {
       if (newList.length === 0) {
         await bot.editMessageText(
@@ -502,19 +504,7 @@ bot.on("callback_query", async (q) => {
           }
         );
       } else {
-        let text = `📋 *Your Tracked Anime \\(${escMd(newList.length)}\\):*\n\n`;
-        newList.forEach((item, i) => {
-          text += `${i + 1}\\. *${escMd(item.title)}* — 🇬🇧 Ep *${escMd(item.dubEpisodes)}*\n`;
-        });
-        text += `\n_Tap a button below to untrack_`;
-
-        const keyboard = newList.map((item) => [
-          {
-            text: `🗑 Untrack: ${item.title}`,
-            callback_data: `untrack_${item.id}`,
-          },
-        ]);
-
+        const { text, keyboard } = buildMyListMessage(newList);
         await bot.editMessageText(text, {
           chat_id: chatId,
           message_id: q.message.message_id,
@@ -526,7 +516,7 @@ bot.on("callback_query", async (q) => {
     return;
   }
 
-  // ── NOOP (✅ Tracked! button — intentionally does nothing) ──
+  // ── NOOP (already tracked button) ──────────────────────────
   if (data.startsWith("noop_")) {
     await bot.answerCallbackQuery(q.id, {
       text: "Already tracked ✅",
@@ -535,18 +525,18 @@ bot.on("callback_query", async (q) => {
     return;
   }
 
-  // ── FALLBACK — always answer to kill spinner (Bug #7 fix) ──
+  // ── FALLBACK ───────────────────────────────────────────────
   await bot.answerCallbackQuery(q.id, { text: "Unknown action." });
 });
 
 // ============================================================
 // ====== ALERT SYSTEM (cron every 30 min) ====================
-// FIX Bug #6: Old code called getFullAnime(anime.id) which
-// passed the numeric ID as a search string — always failed.
-// Now uses getAnimeById() for correct ID-based fetching.
+// Reads every tracked user from Firestore.
+// For each anime, fetches the REAL current dub count.
+// If dubEpisodes > lastEpisodeAlerted → new episode → alert.
 // ============================================================
 cron.schedule("*/30 * * * *", async () => {
-  safeLog("🔔 Running dub episode check...");
+  safeLog("🔔 Checking for new dubbed episodes...");
 
   let snapshot;
   try {
@@ -560,46 +550,42 @@ cron.schedule("*/30 * * * *", async () => {
     const userId = doc.id;
     const list = doc.data().tracking || [];
 
-    for (const anime of list) {
+    for (const tracked of list) {
       try {
-        const fresh = await getAnimeById(anime.id); // FIX Bug #6
-        if (!fresh) continue;
+        // Get real dub count from AnimeSchedule
+        const schedData = await getRealDubCount(tracked.id);
+        if (!schedData) continue;
 
-        const dub = await getDubInfo(fresh);
+        const currentDubCount = schedData.dubEpisodes;
+        if (currentDubCount === null || currentDubCount === undefined) continue;
 
-        if (dub.dubEpisodes > anime.lastEpisodeAlerted) {
-          const title = fresh.title.english || fresh.title.romaji;
+        const lastAlerted = tracked.lastEpisodeAlerted ?? 0;
+
+        if (currentDubCount > lastAlerted) {
+          // 🚨 New dubbed episode detected!
+          const newEpisode = currentDubCount;
 
           await bot.sendMessage(
             userId,
             `🚨 *New Dubbed Episode Alert\\!*\n\n` +
-              `🎬 *${escMd(title)}*\n` +
-              `🇬🇧 Episode *${escMd(dub.dubEpisodes)}* is now available dubbed\\!\n\n` +
+              `🎬 *${escMd(tracked.title)}*\n\n` +
+              `🇬🇧 Episode *${escMd(newEpisode)}* is now available in English dub\\!\n\n` +
               `_Use /mylist to manage your tracked anime_`,
             { parse_mode: "MarkdownV2" }
           );
 
-          // Update Firestore so we don't alert twice for same episode
-          await updateLastAlerted(userId, anime.id, dub.dubEpisodes);
+          await updateLastAlerted(userId, tracked.id, newEpisode);
         }
       } catch (err) {
-        console.error(`Alert error for anime ${anime.id}:`, err.message);
+        console.error(`Alert error for anime ${tracked.id}:`, err.message);
       }
     }
   }
 });
 
 // ============================================================
-// ====== GLOBAL ERROR HANDLERS (prevent crashes) =============
+// ====== GLOBAL ERROR HANDLERS ===============================
 // ============================================================
-bot.on("polling_error", (err) => {
-  console.error("Polling error:", err.message);
-});
-
-process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled rejection:", reason);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught exception:", err.message);
-});
+bot.on("polling_error", (err) => console.error("Polling error:", err.message));
+process.on("unhandledRejection", (r) => console.error("Unhandled rejection:", r));
+process.on("uncaughtException", (err) => console.error("Uncaught exception:", err.message));
