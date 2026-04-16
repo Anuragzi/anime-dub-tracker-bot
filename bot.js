@@ -1,6 +1,21 @@
 // ============================================================
 // ====== ANIME DUB TRACKER BOT — bot.js =====================
 // ============================================================
+// HOW DUB COUNT WORKS (important to understand):
+//
+// AnimeSchedule timetable returns the NEXT upcoming episode.
+// Example from your screenshot: "Ep 6 Dub: 6d 1h 57m"
+// → EpisodeNumber = 6  (next episode, not yet aired)
+// → Current dubbed episodes available = 6 - 1 = 5
+//
+// We use: GET /api/v3/timetables/dub  (no params needed)
+// It returns ALL currently airing dubbed shows this week.
+// We match by AniList ID via the /anime endpoint first to get
+// the show's route/slug, then find it in the timetable.
+//
+// For FINISHED shows (all eps dubbed), we use episodeCount
+// from the /anime endpoint directly.
+// ============================================================
 
 require("dotenv").config();
 
@@ -104,6 +119,8 @@ async function getAnimeById(id) {
 
 // ============================================================
 // ====== ANIMESCHEDULE — STEP 1: Get show route by AniList ID
+// The /anime endpoint gives us the show's unique route (slug)
+// AND tells us if the show is finished (all eps dubbed).
 // ============================================================
 async function getAnimeScheduleEntry(anilistId) {
   if (!process.env.ANIMESCHEDULE_KEY) return null;
@@ -114,7 +131,7 @@ async function getAnimeScheduleEntry(anilistId) {
       timeout: 10000,
     });
 
-    // 🔥 FIX: Handle nested response structure
+    // Handle nested response structure
     const data = res.data?.data || res.data || [];
     const entry = Array.isArray(data) ? data[0] : data;
     
@@ -133,6 +150,14 @@ async function getAnimeScheduleEntry(anilistId) {
 
 // ============================================================
 // ====== ANIMESCHEDULE — STEP 2: Get current dub timetable ===
+// Returns this week's dub schedule. Each entry has:
+//   route          — unique slug matching /anime entry
+//   episodeNumber  — the NEXT episode about to air
+//   episodeDate    — when it airs (ISO datetime)
+//   title          — show title
+//
+// CURRENT DUB COUNT = episodeNumber - 1
+// (because episodeNumber is what's UPCOMING, not yet released)
 // ============================================================
 async function getDubTimetable() {
   if (!process.env.ANIMESCHEDULE_KEY) return [];
@@ -142,7 +167,7 @@ async function getDubTimetable() {
       timeout: 10000,
     });
 
-    // 🔥 FIX: Handle nested response structure properly
+    // Handle multiple response structures
     let entries = [];
     if (Array.isArray(res.data)) {
       entries = res.data;
@@ -151,7 +176,6 @@ async function getDubTimetable() {
     } else if (Array.isArray(res.data?.results)) {
       entries = res.data.results;
     } else if (typeof res.data === 'object' && res.data !== null) {
-      // If it's an object with possible entry list
       entries = Object.values(res.data).filter(v => Array.isArray(v))[0] || [];
     }
 
@@ -173,15 +197,17 @@ async function getDubTimetable() {
 
 // ============================================================
 // ====== MASTER DUB LOOKUP ===================================
+// Returns { dubEpisodes, totalEpisodes, nextEpDate } or null
 // ============================================================
 async function getDubCount(anilistId, fallbackTitle) {
   if (!process.env.ANIMESCHEDULE_KEY) return null;
 
-  // Step 1: Get the show's AnimeSchedule entry
+  // Step 1: Get the show's AnimeSchedule entry (for route + status)
   const entry = await getAnimeScheduleEntry(anilistId);
 
   // Step 2: If show is FINISHED, all episodes are dubbed
-  if (entry && entry.status === "finished" && entry.episodes > 0) {
+  // ✅ FIX: Use case-insensitive status check
+  if (entry && entry.status?.toLowerCase() === "finished" && entry.episodes > 0) {
     console.log(`[DubCount] "${fallbackTitle}" is FINISHED → all ${entry.episodes} eps dubbed`);
     return {
       dubEpisodes: entry.episodes,
@@ -203,7 +229,6 @@ async function getDubCount(anilistId, fallbackTitle) {
       console.log(`[DubCount] matched by route: "${match.route}" epNum=${match.episodeNumber}`);
     } else {
       console.log(`[DubCount] route "${entry.route}" not found in timetable (${timetable.length} entries)`);
-      // Debug: show what routes are available
       const routes = timetable.map(t => t.route).slice(0, 5);
       console.log(`[DubCount] Sample routes in timetable:`, routes);
     }
@@ -225,6 +250,7 @@ async function getDubCount(anilistId, fallbackTitle) {
     return null;
   }
 
+  // episodeNumber = NEXT ep to air → current dubbed = episodeNumber - 1
   const nextEpNum = match.episodeNumber || 0;
   const currentDubbed = Math.max(0, nextEpNum - 1);
   const nextEpDate = match.episodeDate ? new Date(match.episodeDate) : null;
@@ -496,6 +522,8 @@ bot.on("callback_query", async (q) => {
 
 // ============================================================
 // ====== ALERT CRON (every 30 min) ===========================
+// Fetches the dub timetable ONCE per run, then checks each
+// tracked anime against it — avoids hammering the API.
 // ============================================================
 cron.schedule("*/30 * * * *", async () => {
   safeLog("🔔 Checking for new dubbed episodes...");
@@ -504,6 +532,7 @@ cron.schedule("*/30 * * * *", async () => {
   try { snapshot = await db.collection("users").get(); }
   catch (err) { console.error("Firestore error:", err.message); return; }
 
+  // Fetch timetable once for the whole cron run
   const timetable = await getDubTimetable();
 
   for (const doc of snapshot.docs) {
@@ -512,11 +541,13 @@ cron.schedule("*/30 * * * *", async () => {
 
     for (const tracked of list) {
       try {
+        // Get the AnimeSchedule entry to check status + route
         const entry = await getAnimeScheduleEntry(tracked.id);
 
         let currentDub = null;
 
-        if (entry?.status === "finished" && entry?.episodes > 0) {
+        // ✅ FIX: Use case-insensitive status check
+        if (entry?.status?.toLowerCase() === "finished" && entry?.episodes > 0) {
           currentDub = entry.episodes;
         } else if (entry?.route) {
           const match = timetable.find((t) => t.route === entry.route);
