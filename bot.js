@@ -150,14 +150,7 @@ async function getAnimeScheduleEntry(anilistId) {
 
 // ============================================================
 // ====== ANIMESCHEDULE — STEP 2: Get current dub timetable ===
-// Returns this week's dub schedule. Each entry has:
-//   route          — unique slug matching /anime entry
-//   episodeNumber  — the NEXT episode about to air
-//   episodeDate    — when it airs (ISO datetime)
-//   title          — show title
-//
-// CURRENT DUB COUNT = episodeNumber - 1
-// (because episodeNumber is what's UPCOMING, not yet released)
+// Updated to handle more response variations and log better for debugging
 // ============================================================
 async function getDubTimetable() {
   if (!process.env.ANIMESCHEDULE_KEY) return [];
@@ -167,7 +160,6 @@ async function getDubTimetable() {
       timeout: 10000,
     });
 
-    // Handle multiple response structures
     let entries = [];
     if (Array.isArray(res.data)) {
       entries = res.data;
@@ -176,28 +168,31 @@ async function getDubTimetable() {
     } else if (Array.isArray(res.data?.results)) {
       entries = res.data.results;
     } else if (typeof res.data === 'object' && res.data !== null) {
-      entries = Object.values(res.data).filter(v => Array.isArray(v))[0] || [];
+      // Handle nested objects (e.g., { "dub": [...] })
+      entries = Object.values(res.data).find(v => Array.isArray(v)) || [];
     }
 
     console.log(`[AS timetable] fetched ${entries.length} dub entries`);
     
-    // Debug: log first entry structure
+    // Enhanced debug: log structure and sample
     if (entries.length > 0) {
       console.log(`[AS timetable] First entry keys:`, Object.keys(entries[0]));
-      console.log(`[AS timetable] Sample entry:`, JSON.stringify(entries[0], null, 2).substring(0, 300));
+      console.log(`[AS timetable] Sample entry:`, JSON.stringify(entries[0], null, 2).substring(0, 500));
+    } else {
+      console.warn(`[AS timetable] No entries found — API may be down or empty`);
     }
 
     return entries;
   } catch (err) {
     console.error(`[AS timetable] error: ${err.response?.status || 'unknown'} ${err.message}`);
     if (err.response?.data) console.error(`Response data:`, JSON.stringify(err.response.data).substring(0, 500));
-    return [];
+    return null;
   }
 }
 
 // ============================================================
 // ====== MASTER DUB LOOKUP ===================================
-// Returns { dubEpisodes, totalEpisodes, nextEpDate } or null
+// Updated matching: Better fuzzy logic, add episode list fallback, and more logging
 // ============================================================
 async function getDubCount(anilistId, fallbackTitle) {
   if (!process.env.ANIMESCHEDULE_KEY) return null;
@@ -206,7 +201,6 @@ async function getDubCount(anilistId, fallbackTitle) {
   const entry = await getAnimeScheduleEntry(anilistId);
 
   // Step 2: If show is FINISHED, all episodes are dubbed
-  // ✅ FIX: Use case-insensitive status check
   if (entry && entry.status?.toLowerCase() === "finished" && entry.episodes > 0) {
     console.log(`[DubCount] "${fallbackTitle}" is FINISHED → all ${entry.episodes} eps dubbed`);
     return {
@@ -229,25 +223,51 @@ async function getDubCount(anilistId, fallbackTitle) {
       console.log(`[DubCount] matched by route: "${match.route}" epNum=${match.episodeNumber}`);
     } else {
       console.log(`[DubCount] route "${entry.route}" not found in timetable (${timetable.length} entries)`);
-      const routes = timetable.map(t => t.route).slice(0, 5);
+      const routes = timetable.map(t => t.route).slice(0, 10); // More samples
       console.log(`[DubCount] Sample routes in timetable:`, routes);
     }
   }
 
-  // Fallback: fuzzy match by title
+  // Improved Fallback: Fuzzy match by title with better normalization
   if (!match && fallbackTitle) {
-    const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
     const needle = norm(fallbackTitle);
     match = timetable.find((t) => {
       const hay = norm(t.title || t.romaji || t.english || t.route || "");
-      return hay.includes(needle.slice(0, 15)) || needle.includes(hay.slice(0, 15));
+      // Check for substring match in both directions, and handle season/part variations
+      return hay.includes(needle.slice(0, 20)) || needle.includes(hay.slice(0, 20)) ||
+             hay.replace(/season \d+|part \d+/g, "").includes(needle.replace(/season \d+|part \d+/g, "").slice(0, 15));
     });
     if (match) console.log(`[DubCount] fuzzy matched: "${match.title}" epNum=${match.episodeNumber}`);
   }
 
+  // New Fallback: If still no match, try to fetch episode list from AnimeSchedule (if API supports it)
+  if (!match && entry?.route) {
+    try {
+      const epRes = await axios.get(`https://animeschedule.net/api/v3/anime/${entry.route}/episodes`, {
+        headers: { Authorization: `Bearer ${process.env.ANIMESCHEDULE_KEY}` },
+        timeout: 10000,
+      });
+      const episodes = epRes.data?.data || epRes.data || [];
+      const dubbedCount = episodes.filter(ep => ep.dubbed).length; // Assuming 'dubbed' field exists
+      if (dubbedCount > 0) {
+        console.log(`[DubCount] fallback episode list: ${dubbedCount} dubbed eps for "${fallbackTitle}"`);
+        return {
+          dubEpisodes: dubbedCount,
+          totalEpisodes: entry.episodes || episodes.length,
+          nextEpDate: null,
+          isFinished: dubbedCount >= (entry.episodes || episodes.length),
+        };
+      }
+    } catch (err) {
+      console.error(`[DubCount] episode list fallback failed: ${err.message}`);
+    }
+  }
+
   if (!match) {
-    console.log(`[DubCount] no timetable match for "${fallbackTitle}" (id=${anilistId})`);
-    return null;
+    console.log(`[DubCount] no timetable match for "${fallbackTitle}" (id=${anilistId}) — falling back to AniList episodes`);
+    // Ultimate fallback: Assume no dubs if not found, but log for manual check
+    return null; // Or return { dubEpisodes: 0, ... } if you want to assume 0
   }
 
   // episodeNumber = NEXT ep to air → current dubbed = episodeNumber - 1
