@@ -150,59 +150,43 @@ async function getAnimeScheduleEntry(anilistId) {
 
 // ============================================================
 // ====== ANIMESCHEDULE — STEP 2: Get current dub timetable ===
-// FIXED: Much more detailed debugging
+// Updated to handle more response variations and log better for debugging
 // ============================================================
 async function getDubTimetable() {
-  if (!process.env.ANIMESCHEDULE_KEY) {
-    console.error("❌ ANIMESCHEDULE_KEY=kRn8nmlttiYWLXDh38Wtd7uuGBxuPX");
-    return [];
-  }
+  if (!process.env.ANIMESCHEDULE_KEY) return [];
   try {
-    console.log("[AS timetable] Fetching from https://animeschedule.net/api/v3/timetables/dub");
     const res = await axios.get("https://animeschedule.net/api/v3/timetables/dub", {
       headers: { Authorization: `Bearer ${process.env.ANIMESCHEDULE_KEY}` },
       timeout: 10000,
     });
 
-    console.log("[AS timetable] Response status:", res.status);
-    console.log("[AS timetable] Response keys:", Object.keys(res.data));
-    console.log("[AS timetable] Full response (first 1000 chars):", JSON.stringify(res.data).substring(0, 1000));
-
     let entries = [];
     if (Array.isArray(res.data)) {
       entries = res.data;
-      console.log("[AS timetable] ✅ Response is direct array");
     } else if (Array.isArray(res.data?.data)) {
       entries = res.data.data;
-      console.log("[AS timetable] ✅ Response is res.data.data array");
     } else if (Array.isArray(res.data?.results)) {
       entries = res.data.results;
-      console.log("[AS timetable] ✅ Response is res.data.results array");
     } else if (typeof res.data === 'object' && res.data !== null) {
+      // Handle nested objects (e.g., { "dub": [...] })
       entries = Object.values(res.data).find(v => Array.isArray(v)) || [];
-      console.log("[AS timetable] ✅ Found array in nested object");
     }
 
-    console.log(`[AS timetable] ✅ Fetched ${entries.length} dub entries`);
+    console.log(`[AS timetable] fetched ${entries.length} dub entries`);
     
+    // Enhanced debug: log structure and sample
     if (entries.length > 0) {
       console.log(`[AS timetable] First entry keys:`, Object.keys(entries[0]));
-      console.log(`[AS timetable] Sample entry:`, JSON.stringify(entries[0], null, 2));
-      console.log(`[AS timetable] Sample routes:`, entries.slice(0, 5).map(e => e.route || e.title).join(" | "));
+      console.log(`[AS timetable] Sample entry:`, JSON.stringify(entries[0], null, 2).substring(0, 500));
     } else {
-      console.warn(`⚠️  [AS timetable] No entries found — API may be down, empty, or key invalid`);
+      console.warn(`[AS timetable] No entries found — API may be down or empty`);
     }
 
     return entries;
   } catch (err) {
-    console.error(`❌ [AS timetable] error: ${err.response?.status || 'unknown'} ${err.message}`);
-    if (err.response?.data) {
-      console.error(`[AS timetable] Response data:`, JSON.stringify(err.response.data).substring(0, 1000));
-    }
-    if (err.code === 'ECONNABORTED') {
-      console.error("[AS timetable] ⏱️  Request timeout — API may be slow or down");
-    }
-    return [];
+    console.error(`[AS timetable] error: ${err.response?.status || 'unknown'} ${err.message}`);
+    if (err.response?.data) console.error(`Response data:`, JSON.stringify(err.response.data).substring(0, 500));
+    return null;
   }
 }
 
@@ -585,7 +569,7 @@ cron.schedule("*/30 * * * *", async () => {
         // ✅ FIX: Use case-insensitive status check
         if (entry?.status?.toLowerCase() === "finished" && entry?.episodes > 0) {
           currentDub = entry.episodes;
-        } else if (entry?.route && timetable?.length > 0) {
+        } else if (entry?.route) {
           const match = timetable.find((t) => t.route === entry.route);
           if (match) currentDub = Math.max(0, (match.episodeNumber || 1) - 1);
         }
