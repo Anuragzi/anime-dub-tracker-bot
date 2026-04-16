@@ -48,7 +48,7 @@ console.log("✅ Firebase connected");
 
 // ====== BOT ======
 if (!process.env.BOT_TOKEN) { console.error("❌ BOT_TOKEN missing"); process.exit(1); }
-if (!process.env.ANIMESCHEDULE_KEY) console.warn("⚠️  ANIMESCHEDULE_KEY not set");
+if (!process.env.ANIMESCHEDULE_KEY) console.warn("⚠️  ANIMESCHEDULE_KEY=kRn8nmlttiYWLXDh38Wtd7uuGBxuPX");
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 bot.getMe().then((me) => console.log(`🤖 Bot: @${me.username}`));
