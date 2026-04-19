@@ -48,7 +48,7 @@ console.log("✅ Firebase connected");
 
 // ====== BOT ======
 if (!process.env.BOT_TOKEN) { console.error("❌ BOT_TOKEN missing"); process.exit(1); }
-if (!process.env.ANIMESCHEDULE_KEY) console.warn("⚠️  ANIMESCHEDULE_KEY=kRn8nmlttiYWLXDh38Wtd7uuGBxuPX");
+if (!process.env.ANIMESCHEDULE_KEY) console.warn("⚠️  ANIMESCHEDULE_KEY not set");
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 bot.getMe().then((me) => console.log(`🤖 Bot: @${me.username}`));
@@ -138,7 +138,7 @@ async function getAnimeScheduleEntry(anilistId) {
     const entry = Array.isArray(data) ? data[0] : data;
 
     if (entry) {
-      console.log(`[AS /anime] id=${anilistId} route="${entry.route}" status="${entry.status}" episodes=${entry.episodes}`);
+      console.log(`[AS /anime] id=${anilistId} route="${entry.route}" status="${entry.status}" episodes=${entry.episodes} dubPremier="${entry.dubPremier}"`);
     } else {
       console.log(`[AS /anime] id=${anilistId} → no result`);
     }
@@ -191,24 +191,59 @@ async function getDubTimetable() {
 }
 
 // ============================================================
+// ====== HELPER: Check if dubPremier is valid ================
+// ============================================================
+function hasValidDubPremier(entry) {
+  if (!entry || !entry.dubPremier) return false;
+  // Check if it's not the default zero date
+  return entry.dubPremier !== "0001-01-01T00:00:00Z";
+}
+
+// ============================================================
 // ====== MASTER DUB LOOKUP ===================================
-// Updated matching: Better route/title/ID matching to avoid missing shows
+// IMPROVED: Now properly handles BOTH ongoing AND completed dubs
 // ============================================================
 async function getDubCount(anilistId, fallbackTitle) {
   if (!process.env.ANIMESCHEDULE_KEY) return null;
 
   const entry = await getAnimeScheduleEntry(anilistId);
+  
+  if (!entry) {
+    console.log(`[DubCount] no AnimeSchedule entry for "${fallbackTitle}"`);
+    return null;
+  }
 
-  if (entry && entry.status?.toLowerCase() === "finished" && entry.episodes > 0) {
-    console.log(`[DubCount] "${fallbackTitle}" is FINISHED → all ${entry.episodes} eps dubbed`);
+  // ============================================================
+  // CASE 1: COMPLETED DUB (Finished show + has dubPremier)
+  // Example: Death Note, Gintama, Shield Hero S2
+  // ============================================================
+  const isFinished = entry.status?.toLowerCase() === "finished";
+  const hasDub = hasValidDubPremier(entry);
+  const totalEpisodes = entry.episodes || 0;
+  
+  if (isFinished && hasDub && totalEpisodes > 0) {
+    console.log(`[DubCount] "${fallbackTitle}" is a COMPLETED DUB → all ${totalEpisodes} episodes dubbed`);
     return {
-      dubEpisodes: entry.episodes,
-      totalEpisodes: entry.episodes,
+      dubEpisodes: totalEpisodes,
+      totalEpisodes: totalEpisodes,
       nextEpDate: null,
       isFinished: true,
     };
   }
 
+  // ============================================================
+  // CASE 2: Has dub but not finished (dub started, but show ongoing)
+  // Example: A show that has a dub but no upcoming episodes scheduled
+  // ============================================================
+  if (hasDub && !isFinished) {
+    console.log(`[DubCount] "${fallbackTitle}" has a dub (started ${entry.dubPremier}) but show is ongoing`);
+    // Return null for now - we don't know how many episodes are dubbed
+    // The timetable will handle it if there are upcoming episodes
+  }
+
+  // ============================================================
+  // CASE 3: ONGOING DUB (Found in active timetable)
+  // ============================================================
   const timetable = await getDubTimetable() || [];
   const routeValue = normalizeText(entry?.route);
   const needle = normalizeText(fallbackTitle);
@@ -260,23 +295,29 @@ async function getDubCount(anilistId, fallbackTitle) {
     }
   }
 
-  if (!match) {
-    console.log(`[DubCount] no timetable match for "${fallbackTitle}" (id=${anilistId}) — falling back to AniList episodes`);
-    return null;
+  // ============================================================
+  // CASE 3a: Found in timetable → ONGOING DUB
+  // ============================================================
+  if (match) {
+    const nextEpNum = match.episodeNumber || 0;
+    const currentDubbed = Math.max(0, nextEpNum - 1);
+    const nextEpDate = match.episodeDate ? new Date(match.episodeDate) : null;
+
+    console.log(`[DubCount] nextEp=${nextEpNum} → currentDubbed=${currentDubbed}`);
+
+    return {
+      dubEpisodes: currentDubbed,
+      totalEpisodes: match.episodes || entry?.episodes || null,
+      nextEpDate,
+      isFinished: false,
+    };
   }
 
-  const nextEpNum = match.episodeNumber || 0;
-  const currentDubbed = Math.max(0, nextEpNum - 1);
-  const nextEpDate = match.episodeDate ? new Date(match.episodeDate) : null;
-
-  console.log(`[DubCount] nextEp=${nextEpNum} → currentDubbed=${currentDubbed}`);
-
-  return {
-    dubEpisodes: currentDubbed,
-    totalEpisodes: match.episodes || entry?.episodes || null,
-    nextEpDate,
-    isFinished: false,
-  };
+  // ============================================================
+  // CASE 4: No dub found at all
+  // ============================================================
+  console.log(`[DubCount] no dub data for "${fallbackTitle}" (id=${anilistId})`);
+  return null;
 }
 
 // ============================================================
@@ -558,7 +599,8 @@ cron.schedule("*/30 * * * *", async () => {
 
         let currentDub = null;
 
-        if (entry?.status?.toLowerCase() === "finished" && entry?.episodes > 0) {
+        // Check for completed dub first
+        if (entry?.status?.toLowerCase() === "finished" && entry?.dubPremier && entry?.dubPremier !== "0001-01-01T00:00:00Z" && entry?.episodes > 0) {
           currentDub = entry.episodes;
         } else if (entry?.route && timetable?.length > 0) {
           const match = timetable.find((t) => t.route === entry.route);
