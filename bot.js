@@ -3,18 +3,11 @@
 // ============================================================
 // HOW DUB COUNT WORKS (important to understand):
 //
-// AnimeSchedule timetable returns the NEXT upcoming episode.
-// Example from your screenshot: "Ep 6 Dub: 6d 1h 57m"
-// → EpisodeNumber = 6  (next episode, not yet aired)
-// → Current dubbed episodes available = 6 - 1 = 5
+// PRIORITY 1: Read from dubCache (Firestore) - FAST
+// PRIORITY 2: Fall back to AnimeSchedule API - SLOW (only when cache is stale/missing)
 //
-// We use: GET /api/v3/timetables/dub  (no params needed)
-// It returns ALL currently airing dubbed shows this week.
-// We match by AniList ID via the /anime endpoint first to get
-// the show's route/slug, then find it in the timetable.
-//
-// For FINISHED shows (all eps dubbed), we use episodeCount
-// from the /anime endpoint directly.
+// dubCache is populated by running: node scripts/fetchDubData.js
+// Cache refreshes automatically when data is stale (>24 hours old)
 // ============================================================
 
 require("dotenv").config();
@@ -122,8 +115,6 @@ async function getAnimeById(id) {
 
 // ============================================================
 // ====== ANIMESCHEDULE — STEP 1: Get show route by AniList ID
-// The /anime endpoint gives us the show's unique route (slug)
-// AND tells us if the show is finished (all eps dubbed).
 // ============================================================
 async function getAnimeScheduleEntry(anilistId) {
   if (!process.env.ANIMESCHEDULE_KEY) return null;
@@ -152,7 +143,6 @@ async function getAnimeScheduleEntry(anilistId) {
 
 // ============================================================
 // ====== ANIMESCHEDULE — STEP 2: Get current dub timetable ===
-// Updated to handle more response variations and log better for debugging
 // ============================================================
 async function getDubTimetable() {
   if (!process.env.ANIMESCHEDULE_KEY) return [];
@@ -174,18 +164,9 @@ async function getDubTimetable() {
     }
 
     console.log(`[AS timetable] fetched ${entries.length} dub entries`);
-
-    if (entries.length > 0) {
-      console.log(`[AS timetable] First entry keys:`, Object.keys(entries[0]));
-      console.log(`[AS timetable] Sample entry:`, JSON.stringify(entries[0], null, 2).substring(0, 500));
-    } else {
-      console.warn(`[AS timetable] No entries found — API may be down or empty`);
-    }
-
     return entries;
   } catch (err) {
     console.error(`[AS timetable] error: ${err.response?.status || 'unknown'} ${err.message}`);
-    if (err.response?.data) console.error(`Response data:`, JSON.stringify(err.response.data).substring(0, 500));
     return [];
   }
 }
@@ -195,15 +176,60 @@ async function getDubTimetable() {
 // ============================================================
 function hasValidDubPremier(entry) {
   if (!entry || !entry.dubPremier) return false;
-  // Check if it's not the default zero date
   return entry.dubPremier !== "0001-01-01T00:00:00Z";
 }
 
 // ============================================================
 // ====== MASTER DUB LOOKUP ===================================
-// IMPROVED: Now properly handles BOTH ongoing AND completed dubs
+// PRIORITY 1: Read from dubCache (FAST)
+// PRIORITY 2: Fall back to API (SLOW, only when needed)
 // ============================================================
 async function getDubCount(anilistId, fallbackTitle) {
+  // ============================================================
+  // STEP 1: Check dubCache FIRST (much faster!)
+  // ============================================================
+  try {
+    const cacheDoc = await db.collection("dubCache").doc(String(anilistId)).get();
+    
+    if (cacheDoc.exists) {
+      const cached = cacheDoc.data();
+      
+      // Check if cache is fresh (less than 24 hours old)
+      let lastUpdated = cached.lastUpdated;
+      if (lastUpdated && typeof lastUpdated.toDate === 'function') {
+        lastUpdated = lastUpdated.toDate().getTime();
+      } else if (lastUpdated && typeof lastUpdated === 'object' && lastUpdated._seconds) {
+        lastUpdated = lastUpdated._seconds * 1000;
+      } else if (typeof lastUpdated === 'number') {
+        lastUpdated = lastUpdated;
+      } else {
+        lastUpdated = 0;
+      }
+      
+      const isFresh = lastUpdated && (Date.now() - lastUpdated) < 24 * 60 * 60 * 1000;
+      
+      if (isFresh && cached.dubEpisodes !== undefined && cached.dubEpisodes !== null) {
+        console.log(`[DubCount] ✅ Using CACHED data for "${fallbackTitle}" → ${cached.dubEpisodes} eps dubbed (${cached.dubStatus || 'unknown'})`);
+        
+        return {
+          dubEpisodes: cached.dubEpisodes,
+          totalEpisodes: cached.totalEpisodes,
+          nextEpDate: cached.nextEpisodeDate,
+          isFinished: cached.isFinished || false,
+        };
+      } else if (cached.dubEpisodes !== undefined && cached.dubEpisodes !== null) {
+        console.log(`[DubCount] ⚠️ Cache stale for "${fallbackTitle}" (${lastUpdated ? Math.round((Date.now() - lastUpdated)/3600000) : 'unknown'}h old), refreshing from API...`);
+      } else {
+        console.log(`[DubCount] ⚠️ Cache invalid for "${fallbackTitle}", refreshing...`);
+      }
+    }
+  } catch (err) {
+    console.log(`[DubCount] Cache check failed for ${fallbackTitle}:`, err.message);
+  }
+  
+  // ============================================================
+  // STEP 2: If not in cache or stale, fall back to API
+  // ============================================================
   if (!process.env.ANIMESCHEDULE_KEY) return null;
 
   const entry = await getAnimeScheduleEntry(anilistId);
@@ -213,16 +239,27 @@ async function getDubCount(anilistId, fallbackTitle) {
     return null;
   }
 
-  // ============================================================
-  // CASE 1: COMPLETED DUB (Finished show + has dubPremier)
-  // Example: Death Note, Gintama, Shield Hero S2
-  // ============================================================
+  // Check for completed dub
   const isFinished = entry.status?.toLowerCase() === "finished";
   const hasDub = hasValidDubPremier(entry);
   const totalEpisodes = entry.episodes || 0;
   
   if (isFinished && hasDub && totalEpisodes > 0) {
     console.log(`[DubCount] "${fallbackTitle}" is a COMPLETED DUB → all ${totalEpisodes} episodes dubbed`);
+    
+    // Save to cache for next time
+    await db.collection("dubCache").doc(String(anilistId)).set({
+      anilistId: anilistId,
+      title: fallbackTitle,
+      totalEpisodes: totalEpisodes,
+      dubEpisodes: totalEpisodes,
+      nextEpisode: null,
+      nextEpisodeDate: null,
+      isFinished: true,
+      dubStatus: "completed",
+      lastUpdated: new Date(),
+    }, { merge: true });
+    
     return {
       dubEpisodes: totalEpisodes,
       totalEpisodes: totalEpisodes,
@@ -231,35 +268,15 @@ async function getDubCount(anilistId, fallbackTitle) {
     };
   }
 
-  // ============================================================
-  // CASE 2: Has dub but not finished (dub started, but show ongoing)
-  // Example: A show that has a dub but no upcoming episodes scheduled
-  // ============================================================
-  if (hasDub && !isFinished) {
-    console.log(`[DubCount] "${fallbackTitle}" has a dub (started ${entry.dubPremier}) but show is ongoing`);
-    // Return null for now - we don't know how many episodes are dubbed
-    // The timetable will handle it if there are upcoming episodes
-  }
-
-  // ============================================================
-  // CASE 3: ONGOING DUB (Found in active timetable)
-  // ============================================================
+  // Check ongoing timetable
   const timetable = await getDubTimetable() || [];
-  const routeValue = normalizeText(entry?.route);
-  const needle = normalizeText(fallbackTitle);
-
   let match = null;
 
   if (entry?.route) {
     match = timetable.find((t) => {
       const routeValueT = normalizeText(t.route || t.slug || t.route_slug || t.slug_name);
-      return routeValueT && routeValueT === routeValue;
+      return routeValueT && routeValueT === normalizeText(entry.route);
     });
-    if (match) {
-      console.log(`[DubCount] matched by route: "${match.route || match.slug}" epNum=${match.episodeNumber}`);
-    } else {
-      console.log(`[DubCount] route "${entry.route}" not found in timetable (${timetable.length} entries)`);
-    }
   }
 
   if (!match) {
@@ -267,43 +284,29 @@ async function getDubCount(anilistId, fallbackTitle) {
       if (t.anilistId && parseInt(t.anilistId) === parseInt(anilistId)) return true;
       if (t.anilist_id && parseInt(t.anilist_id) === parseInt(anilistId)) return true;
       if (t.anilistIds && Array.isArray(t.anilistIds) && t.anilistIds.map(String).includes(String(anilistId))) return true;
-      if (t.anime?.id && parseInt(t.anime.id) === parseInt(anilistId)) return true;
-
-      const titleFields = [
-        t.title,
-        t.romaji,
-        t.english,
-        t.name,
-        t.route,
-        t.slug,
-        t.anime?.title,
-        t.anime?.name,
-      ];
-      const hay = normalizeText(titleFields.map((field) => {
-        if (typeof field === "string") return field;
-        if (typeof field === "object" && field !== null) {
-          return field.romaji || field.english || field.native || field.title || field.name || "";
-        }
-        return "";
-      }).join(" "));
-
-      if (!needle || !hay) return false;
-      return hay === needle || hay.includes(needle) || needle.includes(hay);
+      return false;
     });
-    if (match) {
-      console.log(`[DubCount] matched by title/ID: "${match.title || match.route || match.name}" epNum=${match.episodeNumber}`);
-    }
   }
 
-  // ============================================================
-  // CASE 3a: Found in timetable → ONGOING DUB
-  // ============================================================
   if (match) {
     const nextEpNum = match.episodeNumber || 0;
     const currentDubbed = Math.max(0, nextEpNum - 1);
     const nextEpDate = match.episodeDate ? new Date(match.episodeDate) : null;
 
-    console.log(`[DubCount] nextEp=${nextEpNum} → currentDubbed=${currentDubbed}`);
+    console.log(`[DubCount] ONGOING: "${fallbackTitle}" → ${currentDubbed} eps dubbed (next: ${nextEpNum})`);
+    
+    // Save to cache
+    await db.collection("dubCache").doc(String(anilistId)).set({
+      anilistId: anilistId,
+      title: fallbackTitle,
+      totalEpisodes: match.episodes || entry?.episodes || 0,
+      dubEpisodes: currentDubbed,
+      nextEpisode: nextEpNum,
+      nextEpisodeDate: nextEpDate,
+      isFinished: false,
+      dubStatus: "ongoing",
+      lastUpdated: new Date(),
+    }, { merge: true });
 
     return {
       dubEpisodes: currentDubbed,
@@ -313,10 +316,7 @@ async function getDubCount(anilistId, fallbackTitle) {
     };
   }
 
-  // ============================================================
-  // CASE 4: No dub found at all
-  // ============================================================
-  console.log(`[DubCount] no dub data for "${fallbackTitle}" (id=${anilistId})`);
+  console.log(`[DubCount] no dub data for "${fallbackTitle}"`);
   return null;
 }
 
@@ -577,8 +577,7 @@ bot.on("callback_query", async (q) => {
 
 // ============================================================
 // ====== ALERT CRON (every 30 min) ===========================
-// Fetches the dub timetable ONCE per run, then checks each
-// tracked anime against it — avoids hammering the API.
+// Now reads from dubCache FIRST, then falls back to API
 // ============================================================
 cron.schedule("*/30 * * * *", async () => {
   safeLog("🔔 Checking for new dubbed episodes...");
@@ -587,24 +586,32 @@ cron.schedule("*/30 * * * *", async () => {
   try { snapshot = await db.collection("users").get(); }
   catch (err) { console.error("Firestore error:", err.message); return; }
 
-  const timetable = await getDubTimetable();
-
   for (const doc of snapshot.docs) {
     const userId = doc.id;
     const list = doc.data().tracking || [];
 
     for (const tracked of list) {
       try {
-        const entry = await getAnimeScheduleEntry(tracked.id);
-
         let currentDub = null;
-
-        // Check for completed dub first
-        if (entry?.status?.toLowerCase() === "finished" && entry?.dubPremier && entry?.dubPremier !== "0001-01-01T00:00:00Z" && entry?.episodes > 0) {
-          currentDub = entry.episodes;
-        } else if (entry?.route && timetable?.length > 0) {
-          const match = timetable.find((t) => t.route === entry.route);
-          if (match) currentDub = Math.max(0, (match.episodeNumber || 1) - 1);
+        
+        // FIRST: Check dubCache
+        const cacheDoc = await db.collection("dubCache").doc(String(tracked.id)).get();
+        
+        if (cacheDoc.exists) {
+          const cached = cacheDoc.data();
+          currentDub = cached.dubEpisodes;
+          console.log(`[Alert] Using cached dub count for ${tracked.title}: ${currentDub}`);
+        } else {
+          // FALLBACK: Check API directly
+          const entry = await getAnimeScheduleEntry(tracked.id);
+          
+          if (entry?.status?.toLowerCase() === "finished" && entry?.dubPremier && entry?.dubPremier !== "0001-01-01T00:00:00Z" && entry?.episodes > 0) {
+            currentDub = entry.episodes;
+          } else if (entry?.route) {
+            const timetable = await getDubTimetable();
+            const match = timetable.find((t) => t.route === entry.route);
+            if (match) currentDub = Math.max(0, (match.episodeNumber || 1) - 1);
+          }
         }
 
         if (currentDub === null) continue;
