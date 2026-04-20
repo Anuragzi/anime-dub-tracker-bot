@@ -76,26 +76,18 @@ async function getAnimeBySearch(search) {
       "https://graphql.anilist.co",
       {
         query: `query ($s: String) {
-          Page(perPage: 5) {
-            media(search: $s, type: ANIME, isAdult: false) {
-              id
-              title { romaji english }
-              episodes
-              status
-              description
-              coverImage { large }
-            }
+          Media(search: $s, type: ANIME, isAdult: false) {
+            id title { romaji english } episodes status description coverImage { large }
           }
         }`,
         variables: { s: search },
       },
       { timeout: 10000 }
     );
-
-    return res.data.data.Page.media;
+    return res.data.data.Media;
   } catch (err) {
     console.error("AniList search error:", err.message);
-    return [];
+    return null;
   }
 }
 
@@ -466,14 +458,14 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
     { parse_mode: "MarkdownV2" }
   );
 
-const results = await getAnimeBySearch(query);
+  const anime = await getAnimeBySearch(query);
+  await bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
 
-if (!results || results.length === 0) {
-  return bot.sendMessage(chatId, "❌ Anime not found.", { parse_mode: "MarkdownV2" });
-}
-
-// pick BEST match (first is usually most accurate)
-const anime = results[0];
+  if (!anime) {
+    return bot.sendMessage(chatId, "❌ Anime not found\\. Try a different spelling\\.", {
+      parse_mode: "MarkdownV2",
+    });
+  }
 
   const data = await buildAnimeData(anime);
   const caption = formatAnimeMessage(data);
