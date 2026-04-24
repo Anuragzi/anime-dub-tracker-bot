@@ -3,13 +3,11 @@
 // ============================================================
 // HOW DUB COUNT WORKS (important to understand):
 //
-// PRIORITY 1: ALWAYS read from dubCache (Firestore) - FAST
-// PRIORITY 2: Fall back to AnimeSchedule API - SLOW (only when cache is missing)
+// PRIORITY 1: Read from dubCache (Firestore) - FAST
+// PRIORITY 2: Fall back to AnimeSchedule API - SLOW (only when cache is stale/missing)
 //
-// dubCache is populated by:
-//   1. Running: node scripts/fetchDubData.js
-//   2. OR via handleUpdate.js (/update command)
-//   3. OR automatically when API is called and data is missing
+// dubCache is populated by running: node scripts/fetchDubData.js
+// Cache refreshes automatically when data is stale (>24 hours old)
 // ============================================================
 
 require("dotenv").config();
@@ -65,6 +63,104 @@ function escMd(t) {
 }
 function normalizeText(text) {
   return (text || "").toString().toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// ============================================================
+// 🆕 NEW: STREAMING SITE HELPERS
+// ============================================================
+
+// Convert anime title to URL-friendly format for streaming sites
+function getSearchQuery(title) {
+  // Remove special characters and normalize
+  let query = title
+    .toLowerCase()
+    .replace(/[′'’]/g, "'")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  
+  // Replace spaces with hyphens or + based on site
+  return {
+    hyphen: query.replace(/ /g, "-"),
+    plus: query.replace(/ /g, "+"),
+    encoded: encodeURIComponent(query),
+  };
+}
+
+// Get streaming site URLs for an anime
+function getStreamingUrls(animeTitle) {
+  const query = getSearchQuery(animeTitle);
+  
+  // 🆕 Add or remove sites here
+  const sites = [
+    {
+      name: "Gogoanime",
+      url: `https://gogoanime.gg/search.html?keyword=${query.encoded}`,
+      emoji: "▶️",
+    },
+    {
+      name: "AnimeKai.to",
+      url: `https://animekai.to/search.html?keyword=${query.encoded}`,
+      emoji: "🎬",
+    },
+    {
+      name: "AnimeKaizoku",
+      url: `https://animekaizoku.com/search?q=${query.encoded}`,
+      emoji: "📺",
+    },
+    {
+      name: "AnimeKayo",
+      url: `https://animekayo.com/?s=${query.encoded}`,
+      emoji: "🍿",
+    },
+  ];
+  
+  return sites;
+}
+
+// 🆕 Create inline keyboard with streaming buttons
+function createStreamingKeyboard(animeTitle, trackCallbackData = null) {
+  const sites = getStreamingUrls(animeTitle);
+  
+  // Create a row of streaming buttons (max 4 per row)
+  const streamingButtons = sites.map(site => ({
+    text: `${site.emoji} ${site.name}`,
+    url: site.url,
+  }));
+  
+  // Split into rows of 3 buttons per row (looks cleaner)
+  const rows = [];
+  for (let i = 0; i < streamingButtons.length; i += 3) {
+    rows.push(streamingButtons.slice(i, i + 3));
+  }
+  
+  // Add the track button if provided
+  if (trackCallbackData) {
+    rows.push([{ text: "📌 Track this anime", callback_data: trackCallbackData }]);
+  }
+  
+  return { inline_keyboard: rows };
+}
+
+// 🆕 Create alert message keyboard (watch now buttons only, no track button)
+function createAlertKeyboard(animeTitle) {
+  const sites = getStreamingUrls(animeTitle);
+  
+  const streamingButtons = sites.map(site => ({
+    text: `${site.emoji} Watch on ${site.name}`,
+    url: site.url,
+  }));
+  
+  // Split into rows of 2 buttons per row for alerts
+  const rows = [];
+  for (let i = 0; i < streamingButtons.length; i += 2) {
+    rows.push(streamingButtons.slice(i, i + 2));
+  }
+  
+  // Add a close/back button
+  rows.push([{ text: "❌ Close", callback_data: "close_alert" }]);
+  
+  return { inline_keyboard: rows };
 }
 
 // ============================================================
@@ -183,13 +279,12 @@ function hasValidDubPremier(entry) {
 
 // ============================================================
 // ====== MASTER DUB LOOKUP ===================================
-// PRIORITY 1: ALWAYS read from dubCache (FAST)
-// PRIORITY 2: Fall back to API (SLOW, only when cache MISSING)
+// PRIORITY 1: Read from dubCache (FAST)
+// PRIORITY 2: Fall back to API (SLOW, only when needed)
 // ============================================================
 async function getDubCount(anilistId, fallbackTitle) {
   // ============================================================
-  // STEP 1: Check dubCache FIRST - ALWAYS use cache if exists
-  // NO 24-hour expiration - cache is the source of truth
+  // STEP 1: Check dubCache FIRST (much faster!)
   // ============================================================
   try {
     const cacheDoc = await db.collection("dubCache").doc(String(anilistId)).get();
@@ -197,16 +292,33 @@ async function getDubCount(anilistId, fallbackTitle) {
     if (cacheDoc.exists) {
       const cached = cacheDoc.data();
       
-      // Check if dubEpisodes exists in cache
-      if (cached.dubEpisodes !== undefined && cached.dubEpisodes !== null) {
+      // Check if cache is fresh (less than 24 hours old)
+      let lastUpdated = cached.lastUpdated;
+      if (lastUpdated && typeof lastUpdated.toDate === 'function') {
+        lastUpdated = lastUpdated.toDate().getTime();
+      } else if (lastUpdated && typeof lastUpdated === 'object' && lastUpdated._seconds) {
+        lastUpdated = lastUpdated._seconds * 1000;
+      } else if (typeof lastUpdated === 'number') {
+        lastUpdated = lastUpdated;
+      } else {
+        lastUpdated = 0;
+      }
+      
+      const isFresh = lastUpdated && (Date.now() - lastUpdated) < 24 * 60 * 60 * 1000;
+      
+      if (isFresh && cached.dubEpisodes !== undefined && cached.dubEpisodes !== null) {
         console.log(`[DubCount] ✅ Using CACHED data for "${fallbackTitle}" → ${cached.dubEpisodes} eps dubbed (${cached.dubStatus || 'unknown'})`);
         
         return {
           dubEpisodes: cached.dubEpisodes,
           totalEpisodes: cached.totalEpisodes,
           nextEpDate: cached.nextEpisodeDate,
-          isFinished: cached.dubStatus === "completed" || cached.isFinished || false,
+          isFinished: cached.isFinished || false,
         };
+      } else if (cached.dubEpisodes !== undefined && cached.dubEpisodes !== null) {
+        console.log(`[DubCount] ⚠️ Cache stale for "${fallbackTitle}" (${lastUpdated ? Math.round((Date.now() - lastUpdated)/3600000) : 'unknown'}h old), refreshing from API...`);
+      } else {
+        console.log(`[DubCount] ⚠️ Cache invalid for "${fallbackTitle}", refreshing...`);
       }
     }
   } catch (err) {
@@ -214,10 +326,8 @@ async function getDubCount(anilistId, fallbackTitle) {
   }
   
   // ============================================================
-  // STEP 2: If NOT in cache at all, fall back to API
+  // STEP 2: If not in cache or stale, fall back to API
   // ============================================================
-  console.log(`[DubCount] No cache found for "${fallbackTitle}", falling back to API...`);
-  
   if (!process.env.ANIMESCHEDULE_KEY) return null;
 
   const entry = await getAnimeScheduleEntry(anilistId);
@@ -245,7 +355,7 @@ async function getDubCount(anilistId, fallbackTitle) {
       nextEpisodeDate: null,
       isFinished: true,
       dubStatus: "completed",
-      lastUpdated: Date.now(),
+      lastUpdated: new Date(),
     }, { merge: true });
     
     return {
@@ -293,7 +403,7 @@ async function getDubCount(anilistId, fallbackTitle) {
       nextEpisodeDate: nextEpDate,
       isFinished: false,
       dubStatus: "ongoing",
-      lastUpdated: Date.now(),
+      lastUpdated: new Date(),
     }, { merge: true });
 
     return {
@@ -448,6 +558,7 @@ bot.onText(/\/help/, (msg) =>
 
 // ============================================================
 // ====== /search =============================================
+// 🆕 UPDATED: Now includes streaming site buttons
 // ============================================================
 bot.onText(/\/search (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
@@ -469,18 +580,23 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
 
   const data = await buildAnimeData(anime);
   const caption = formatAnimeMessage(data);
-  const keyboard = {
-    inline_keyboard: [[{ text: "📌 Track this anime", callback_data: `track_${data.id}` }]],
-  };
+  
+  // 🆕 Create keyboard with streaming buttons + track button
+  const keyboard = createStreamingKeyboard(data.title, `track_${data.id}`);
 
   try {
     if (data.image) {
       await bot.sendPhoto(chatId, data.image, {
-        caption, parse_mode: "MarkdownV2", reply_markup: keyboard,
+        caption, 
+        parse_mode: "MarkdownV2", 
+        reply_markup: keyboard,
       });
     } else throw new Error("no image");
   } catch {
-    await bot.sendMessage(chatId, caption, { parse_mode: "MarkdownV2", reply_markup: keyboard });
+    await bot.sendMessage(chatId, caption, { 
+      parse_mode: "MarkdownV2", 
+      reply_markup: keyboard,
+    });
   }
 });
 
@@ -504,11 +620,21 @@ bot.onText(/\/mylist/, async (msg) => {
 
 // ============================================================
 // ====== CALLBACK QUERY ======================================
+// 🆕 UPDATED: Added close_alert handler
 // ============================================================
 bot.on("callback_query", async (q) => {
   const chatId = q.message.chat.id;
   const userId = q.from.id;
   const data = q.data;
+
+  // 🆕 Handle close alert button
+  if (data === "close_alert") {
+    await bot.answerCallbackQuery(q.id, { text: "Closed" });
+    try {
+      await bot.deleteMessage(chatId, q.message.message_id);
+    } catch (_) {}
+    return;
+  }
 
   if (data.startsWith("track_")) {
     const animeId = parseInt(data.split("_")[1]);
@@ -565,7 +691,7 @@ bot.on("callback_query", async (q) => {
 
 // ============================================================
 // ====== ALERT CRON (every 30 min) ===========================
-// Now ALWAYS reads from dubCache ONLY
+// 🆕 UPDATED: Alert messages now include streaming buttons
 // ============================================================
 cron.schedule("*/30 * * * *", async () => {
   safeLog("🔔 Checking for new dubbed episodes...");
@@ -580,32 +706,47 @@ cron.schedule("*/30 * * * *", async () => {
 
     for (const tracked of list) {
       try {
-        // ONLY read from dubCache - NO API fallback for alerts
+        let currentDub = null;
+        
+        // FIRST: Check dubCache
         const cacheDoc = await db.collection("dubCache").doc(String(tracked.id)).get();
         
-        if (!cacheDoc.exists) {
-          console.log(`[Alert] No cache found for ${tracked.title}, skipping...`);
-          continue;
+        if (cacheDoc.exists) {
+          const cached = cacheDoc.data();
+          currentDub = cached.dubEpisodes;
+          console.log(`[Alert] Using cached dub count for ${tracked.title}: ${currentDub}`);
+        } else {
+          // FALLBACK: Check API directly
+          const entry = await getAnimeScheduleEntry(tracked.id);
+          
+          if (entry?.status?.toLowerCase() === "finished" && entry?.dubPremier && entry?.dubPremier !== "0001-01-01T00:00:00Z" && entry?.episodes > 0) {
+            currentDub = entry.episodes;
+          } else if (entry?.route) {
+            const timetable = await getDubTimetable();
+            const match = timetable.find((t) => t.route === entry.route);
+            if (match) currentDub = Math.max(0, (match.episodeNumber || 1) - 1);
+          }
         }
-        
-        const cached = cacheDoc.data();
-        const currentDub = cached.dubEpisodes;
-        
-        if (currentDub === undefined || currentDub === null) {
-          console.log(`[Alert] No dubEpisodes in cache for ${tracked.title}`);
-          continue;
-        }
+
+        if (currentDub === null) continue;
 
         const lastAlerted = tracked.lastEpisodeAlerted ?? 0;
 
         if (currentDub > lastAlerted) {
+          // 🆕 Create keyboard with streaming buttons for the alert
+          const alertKeyboard = createAlertKeyboard(tracked.title);
+          
           await bot.sendMessage(
             userId,
             `🚨 *New Dubbed Episode Alert\\!*\n\n` +
             `🎬 *${escMd(tracked.title)}*\n\n` +
             `🇬🇧 Episode *${escMd(currentDub)}* is now available in English dub\\!\n\n` +
-            `_Use /mylist to manage your tracked anime_`,
-            { parse_mode: "MarkdownV2" }
+            `🔗 *Watch now:*\n` +
+            `_Click a button below to start watching_`,
+            { 
+              parse_mode: "MarkdownV2",
+              reply_markup: alertKeyboard,
+            }
           );
           await updateLastAlerted(userId, tracked.id, currentDub);
         }
