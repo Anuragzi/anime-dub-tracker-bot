@@ -43,6 +43,28 @@ if (!process.env.ANIMESCHEDULE_KEY) console.warn("⚠️  ANIMESCHEDULE_KEY not 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 bot.getMe().then((me) => console.log(`🤖 Bot: @${me.username}`));
 
+// 👇 CODE SUGGESTIONS 👇
+bot.setMyCommands([
+  {
+    command: "search",
+    description: "🔍 Search for an anime by title"
+  },
+  {
+    command: "mylist",
+    description: "📋 View your tracked anime list"
+  },
+  {
+    command: "help",
+    description: "❓ Show help message"
+  },
+  {
+    command: "start",
+    description: "👋 Start the bot"
+  }
+]).then(() => {
+  console.log("✅ Command menu set successfully!");
+});
+
 // ====== SAFE LOG ======
 let lastLog = 0;
 function safeLog(msg) {
