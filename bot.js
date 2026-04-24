@@ -519,15 +519,16 @@ bot.onText(/\/help/, (msg) =>
   })
 );
 
+/// ============================================================
+// ====== /search - WITH FORCE REPLY (FIXED) ==================
 // ============================================================
-// ====== /search - WITH FORCE REPLY ==========================
-// ============================================================
+
+// Handle /search command without any arguments
 bot.onText(/\/search$/, async (msg) => {
   const chatId = msg.chat.id;
   
-  // Ask the user to type the anime name
-  await bot.sendMessage(chatId, "🔍 *Please type the anime name you want to search for:*", {
-    parse_mode: "MarkdownV2",
+  // Ask the user to type the anime name (plain text, no markdown)
+  await bot.sendMessage(chatId, "🔍 Please type the anime name you want to search for:", {
     reply_markup: {
       force_reply: true,
       selective: true
@@ -535,7 +536,7 @@ bot.onText(/\/search$/, async (msg) => {
   });
 });
 
-// Handle the reply (when user types after force reply)
+// Handle /search with arguments (e.g., "/search Naruto")
 bot.onText(/\/search (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const query = match[1].trim();
@@ -556,8 +557,6 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
 
   const data = await buildAnimeData(anime);
   const caption = formatAnimeMessage(data);
-  
-  // Create keyboard with AnimeKayo button + track button
   const keyboard = createStreamingKeyboard(data.title, `track_${data.id}`);
 
   try {
@@ -576,13 +575,14 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
   }
 });
 
-// Also handle regular text messages that come after force reply
+// Handle plain text messages that are replies to the search prompt
 bot.on("message", async (msg) => {
-  // Check if this is a reply to the search prompt
-  if (msg.reply_to_message && msg.reply_to_message.text === "🔍 *Please type the anime name you want to search for:*") {
+  // Check if this message is a reply to a message
+  if (msg.reply_to_message && msg.reply_to_message.text === "🔍 Please type the anime name you want to search for:") {
     const chatId = msg.chat.id;
     const query = msg.text.trim();
     
+    // Ignore if it's a command
     if (!query || query.startsWith("/")) return;
     
     const placeholder = await bot.sendMessage(chatId,
