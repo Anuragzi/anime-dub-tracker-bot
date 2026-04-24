@@ -4,10 +4,7 @@
 // HOW DUB COUNT WORKS (important to understand):
 //
 // PRIORITY 1: Read from dubCache (Firestore) - FAST
-// PRIORITY 2: Fall back to AnimeSchedule API - SLOW (only when cache is stale/missing)
-//
-// dubCache is populated by running: node scripts/fetchDubData.js
-// Cache refreshes automatically when data is stale (>24 hours old)
+// PRIORITY 2: Fall back to AnimeSchedule API - SLOW (only when cache is missing)
 // ============================================================
 
 require("dotenv").config();
@@ -66,12 +63,11 @@ function normalizeText(text) {
 }
 
 // ============================================================
-// 🆕 NEW: STREAMING SITE HELPERS
+// STREAMING SITE HELPERS (ONLY ANIMEKAYO)
 // ============================================================
 
-// Convert anime title to URL-friendly format for streaming sites
+// Convert anime title to URL-friendly format
 function getSearchQuery(title) {
-  // Remove special characters and normalize
   let query = title
     .toLowerCase()
     .replace(/[′'’]/g, "'")
@@ -79,7 +75,6 @@ function getSearchQuery(title) {
     .replace(/\s+/g, " ")
     .trim();
   
-  // Replace spaces with hyphens or + based on site
   return {
     hyphen: query.replace(/ /g, "-"),
     plus: query.replace(/ /g, "+"),
@@ -87,52 +82,25 @@ function getSearchQuery(title) {
   };
 }
 
-// Get streaming site URLs for an anime
-function getStreamingUrls(animeTitle) {
+// Get AnimeKayo streaming URL
+function getStreamingUrl(animeTitle) {
   const query = getSearchQuery(animeTitle);
   
-  // 🆕 Add or remove sites here
-  const sites = [
-    {
-      name: "Gogoanime",
-      url: `https://gogoanime.gg/search.html?keyword=${query.encoded}`,
-      emoji: "▶️",
-    },
-    {
-      name: "AnimeKai.to",
-      url: `https://animekai.to/search.html?keyword=${query.encoded}`,
-      emoji: "🎬",
-    },
-    {
-      name: "AnimeKaizoku",
-      url: `https://animekaizoku.com/search?q=${query.encoded}`,
-      emoji: "📺",
-    },
-    {
-      name: "AnimeKayo",
-      url: `https://animekayo.com/?s=${query.encoded}`,
-      emoji: "🍿",
-    },
-  ];
-  
-  return sites;
+  return {
+    name: "AnimeKayo",
+    url: `https://animekayo.com/?s=${query.encoded}`,
+    emoji: "🍿",
+  };
 }
 
-// 🆕 Create inline keyboard with streaming buttons
+// Create inline keyboard with AnimeKayo button
 function createStreamingKeyboard(animeTitle, trackCallbackData = null) {
-  const sites = getStreamingUrls(animeTitle);
+  const site = getStreamingUrl(animeTitle);
   
-  // Create a row of streaming buttons (max 4 per row)
-  const streamingButtons = sites.map(site => ({
-    text: `${site.emoji} ${site.name}`,
-    url: site.url,
-  }));
-  
-  // Split into rows of 3 buttons per row (looks cleaner)
   const rows = [];
-  for (let i = 0; i < streamingButtons.length; i += 3) {
-    rows.push(streamingButtons.slice(i, i + 3));
-  }
+  
+  // Add streaming button
+  rows.push([{ text: `${site.emoji} Watch on ${site.name}`, url: site.url }]);
   
   // Add the track button if provided
   if (trackCallbackData) {
@@ -142,23 +110,14 @@ function createStreamingKeyboard(animeTitle, trackCallbackData = null) {
   return { inline_keyboard: rows };
 }
 
-// 🆕 Create alert message keyboard (watch now buttons only, no track button)
+// Create alert message keyboard (watch now button only)
 function createAlertKeyboard(animeTitle) {
-  const sites = getStreamingUrls(animeTitle);
+  const site = getStreamingUrl(animeTitle);
   
-  const streamingButtons = sites.map(site => ({
-    text: `${site.emoji} Watch on ${site.name}`,
-    url: site.url,
-  }));
-  
-  // Split into rows of 2 buttons per row for alerts
-  const rows = [];
-  for (let i = 0; i < streamingButtons.length; i += 2) {
-    rows.push(streamingButtons.slice(i, i + 2));
-  }
-  
-  // Add a close/back button
-  rows.push([{ text: "❌ Close", callback_data: "close_alert" }]);
+  const rows = [
+    [{ text: `${site.emoji} Watch on ${site.name}`, url: site.url }],
+    [{ text: "❌ Close", callback_data: "close_alert" }]
+  ];
   
   return { inline_keyboard: rows };
 }
@@ -280,7 +239,7 @@ function hasValidDubPremier(entry) {
 // ============================================================
 // ====== MASTER DUB LOOKUP ===================================
 // PRIORITY 1: Read from dubCache (FAST)
-// PRIORITY 2: Fall back to API (SLOW, only when needed)
+// PRIORITY 2: Fall back to API (SLOW, only when cache missing)
 // ============================================================
 async function getDubCount(anilistId, fallbackTitle) {
   // ============================================================
@@ -292,21 +251,7 @@ async function getDubCount(anilistId, fallbackTitle) {
     if (cacheDoc.exists) {
       const cached = cacheDoc.data();
       
-      // Check if cache is fresh (less than 24 hours old)
-      let lastUpdated = cached.lastUpdated;
-      if (lastUpdated && typeof lastUpdated.toDate === 'function') {
-        lastUpdated = lastUpdated.toDate().getTime();
-      } else if (lastUpdated && typeof lastUpdated === 'object' && lastUpdated._seconds) {
-        lastUpdated = lastUpdated._seconds * 1000;
-      } else if (typeof lastUpdated === 'number') {
-        lastUpdated = lastUpdated;
-      } else {
-        lastUpdated = 0;
-      }
-      
-      const isFresh = lastUpdated && (Date.now() - lastUpdated) < 24 * 60 * 60 * 1000;
-      
-      if (isFresh && cached.dubEpisodes !== undefined && cached.dubEpisodes !== null) {
+      if (cached.dubEpisodes !== undefined && cached.dubEpisodes !== null) {
         console.log(`[DubCount] ✅ Using CACHED data for "${fallbackTitle}" → ${cached.dubEpisodes} eps dubbed (${cached.dubStatus || 'unknown'})`);
         
         return {
@@ -315,10 +260,6 @@ async function getDubCount(anilistId, fallbackTitle) {
           nextEpDate: cached.nextEpisodeDate,
           isFinished: cached.isFinished || false,
         };
-      } else if (cached.dubEpisodes !== undefined && cached.dubEpisodes !== null) {
-        console.log(`[DubCount] ⚠️ Cache stale for "${fallbackTitle}" (${lastUpdated ? Math.round((Date.now() - lastUpdated)/3600000) : 'unknown'}h old), refreshing from API...`);
-      } else {
-        console.log(`[DubCount] ⚠️ Cache invalid for "${fallbackTitle}", refreshing...`);
       }
     }
   } catch (err) {
@@ -326,7 +267,7 @@ async function getDubCount(anilistId, fallbackTitle) {
   }
   
   // ============================================================
-  // STEP 2: If not in cache or stale, fall back to API
+  // STEP 2: If not in cache, fall back to API
   // ============================================================
   if (!process.env.ANIMESCHEDULE_KEY) return null;
 
@@ -558,7 +499,6 @@ bot.onText(/\/help/, (msg) =>
 
 // ============================================================
 // ====== /search =============================================
-// 🆕 UPDATED: Now includes streaming site buttons
 // ============================================================
 bot.onText(/\/search (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
@@ -581,7 +521,7 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
   const data = await buildAnimeData(anime);
   const caption = formatAnimeMessage(data);
   
-  // 🆕 Create keyboard with streaming buttons + track button
+  // Create keyboard with AnimeKayo button + track button
   const keyboard = createStreamingKeyboard(data.title, `track_${data.id}`);
 
   try {
@@ -620,14 +560,13 @@ bot.onText(/\/mylist/, async (msg) => {
 
 // ============================================================
 // ====== CALLBACK QUERY ======================================
-// 🆕 UPDATED: Added close_alert handler
 // ============================================================
 bot.on("callback_query", async (q) => {
   const chatId = q.message.chat.id;
   const userId = q.from.id;
   const data = q.data;
 
-  // 🆕 Handle close alert button
+  // Handle close alert button
   if (data === "close_alert") {
     await bot.answerCallbackQuery(q.id, { text: "Closed" });
     try {
@@ -691,7 +630,6 @@ bot.on("callback_query", async (q) => {
 
 // ============================================================
 // ====== ALERT CRON (every 30 min) ===========================
-// 🆕 UPDATED: Alert messages now include streaming buttons
 // ============================================================
 cron.schedule("*/30 * * * *", async () => {
   safeLog("🔔 Checking for new dubbed episodes...");
@@ -708,7 +646,7 @@ cron.schedule("*/30 * * * *", async () => {
       try {
         let currentDub = null;
         
-        // FIRST: Check dubCache
+        // Check dubCache
         const cacheDoc = await db.collection("dubCache").doc(String(tracked.id)).get();
         
         if (cacheDoc.exists) {
@@ -716,7 +654,7 @@ cron.schedule("*/30 * * * *", async () => {
           currentDub = cached.dubEpisodes;
           console.log(`[Alert] Using cached dub count for ${tracked.title}: ${currentDub}`);
         } else {
-          // FALLBACK: Check API directly
+          // Fallback to API
           const entry = await getAnimeScheduleEntry(tracked.id);
           
           if (entry?.status?.toLowerCase() === "finished" && entry?.dubPremier && entry?.dubPremier !== "0001-01-01T00:00:00Z" && entry?.episodes > 0) {
@@ -733,7 +671,7 @@ cron.schedule("*/30 * * * *", async () => {
         const lastAlerted = tracked.lastEpisodeAlerted ?? 0;
 
         if (currentDub > lastAlerted) {
-          // 🆕 Create keyboard with streaming buttons for the alert
+          // Create keyboard with AnimeKayo button only
           const alertKeyboard = createAlertKeyboard(tracked.title);
           
           await bot.sendMessage(
@@ -741,8 +679,7 @@ cron.schedule("*/30 * * * *", async () => {
             `🚨 *New Dubbed Episode Alert\\!*\n\n` +
             `🎬 *${escMd(tracked.title)}*\n\n` +
             `🇬🇧 Episode *${escMd(currentDub)}* is now available in English dub\\!\n\n` +
-            `🔗 *Watch now:*\n` +
-            `_Click a button below to start watching_`,
+            `🔗 *Watch now:*`,
             { 
               parse_mode: "MarkdownV2",
               reply_markup: alertKeyboard,
