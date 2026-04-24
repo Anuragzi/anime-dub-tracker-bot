@@ -82,13 +82,13 @@ function getSearchQuery(title) {
   };
 }
 
-// Get AnimeKayo streaming URL
+// Get AnimeKayo streaming URL (corrected domain)
 function getStreamingUrl(animeTitle) {
   const query = getSearchQuery(animeTitle);
   
   return {
     name: "AnimeKayo",
-    url: `https://animekayo.com/?s=${query.encoded}`,
+    url: `https://kayoanime.com/?s=${query.encoded}`,
     emoji: "🍿",
   };
 }
