@@ -520,8 +520,22 @@ bot.onText(/\/help/, (msg) =>
 );
 
 // ============================================================
-// ====== /search =============================================
+// ====== /search - WITH FORCE REPLY ==========================
 // ============================================================
+bot.onText(/\/search$/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  // Ask the user to type the anime name
+  await bot.sendMessage(chatId, "🔍 *Please type the anime name you want to search for:*", {
+    parse_mode: "MarkdownV2",
+    reply_markup: {
+      force_reply: true,
+      selective: true
+    }
+  });
+});
+
+// Handle the reply (when user types after force reply)
 bot.onText(/\/search (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const query = match[1].trim();
@@ -559,6 +573,50 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
       parse_mode: "MarkdownV2", 
       reply_markup: keyboard,
     });
+  }
+});
+
+// Also handle regular text messages that come after force reply
+bot.on("message", async (msg) => {
+  // Check if this is a reply to the search prompt
+  if (msg.reply_to_message && msg.reply_to_message.text === "🔍 *Please type the anime name you want to search for:*") {
+    const chatId = msg.chat.id;
+    const query = msg.text.trim();
+    
+    if (!query || query.startsWith("/")) return;
+    
+    const placeholder = await bot.sendMessage(chatId,
+      `🔍 Searching for *${escMd(query)}*\\.\\.\\.`,
+      { parse_mode: "MarkdownV2" }
+    );
+
+    const anime = await getAnimeBySearch(query);
+    await bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
+
+    if (!anime) {
+      return bot.sendMessage(chatId, "❌ Anime not found\\. Try a different spelling\\.", {
+        parse_mode: "MarkdownV2",
+      });
+    }
+
+    const data = await buildAnimeData(anime);
+    const caption = formatAnimeMessage(data);
+    const keyboard = createStreamingKeyboard(data.title, `track_${data.id}`);
+
+    try {
+      if (data.image) {
+        await bot.sendPhoto(chatId, data.image, {
+          caption, 
+          parse_mode: "MarkdownV2", 
+          reply_markup: keyboard,
+        });
+      } else throw new Error("no image");
+    } catch {
+      await bot.sendMessage(chatId, caption, { 
+        parse_mode: "MarkdownV2", 
+        reply_markup: keyboard,
+      });
+    }
   }
 });
 
