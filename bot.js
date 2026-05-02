@@ -42,10 +42,11 @@ if (!process.env.BOT_TOKEN) { console.error("❌ BOT_TOKEN missing"); process.ex
 if (!process.env.ANIMESCHEDULE_KEY) console.warn("⚠️  ANIMESCHEDULE_KEY not set");
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
-// Add this after creating the bot
-const axios = require("axios");
+
+// Delete any existing webhook to prevent 409 conflict error
 axios.post(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/deleteWebhook`)
   .catch(err => console.log("Webhook delete error:", err.message));
+
 bot.getMe().then((me) => console.log(`🤖 Bot: @${me.username}`));
 
 bot.setMyCommands([
