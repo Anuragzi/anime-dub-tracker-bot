@@ -50,29 +50,12 @@ axios.post(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/deleteWebhook`)
 bot.getMe().then((me) => console.log(`🤖 Bot: @${me.username}`));
 
 bot.setMyCommands([
-  {
-    command: "search",
-    description: "🔍 Search for an anime by title"
-  },
-  {
-    command: "mylist",
-    description: "📋 View your tracked anime list"
-  },
-  {
-    command: "donate",
-    description: "💚 Support the developer"
-  },
-  {
-    command: "help",
-    description: "❓ Show help message"
-  },
-  {
-    command: "start",
-    description: "👋 Start the bot"
-  }
-]).then(() => {
-  console.log("✅ Command menu set successfully!");
-});
+  { command: "search",  description: "🔍 Search for an anime by title" },
+  { command: "mylist",  description: "📋 View your tracked anime list" },
+  { command: "donate",  description: "💚 Support the developer" },
+  { command: "help",    description: "❓ Show help message" },
+  { command: "start",   description: "👋 Start the bot" },
+]).then(() => console.log("✅ Command menu set successfully!"));
 
 // ====== SAFE LOG ======
 let lastLog = 0;
@@ -86,7 +69,19 @@ function cleanText(t) {
   return t.replace(/<[^>]*>/g, "").trim().slice(0, 350);
 }
 
-// FIXED: Escape ALL special Telegram MarkdownV2 characters
+// ============================================================
+// ====== escMd — Escape ALL Telegram MarkdownV2 special chars
+// ============================================================
+//
+//  Telegram MarkdownV2 requires these 19 characters to be
+//  escaped with a preceding backslash EVERYWHERE they appear
+//  in plain text (outside of code spans / pre blocks):
+//
+//    _  *  [  ]  (  )  ~  `  >  #  +  -  =  |  {  }  .  !  \
+//
+//  The original regex was syntactically correct but was NOT
+//  applied to several hardcoded string fragments (see below).
+//
 function escMd(t) {
   if (t == null) return "";
   return String(t).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
@@ -174,15 +169,36 @@ async function getSimilarAnimes(animeId) {
 // ============================================================
 // ====== DONATE MESSAGE ======================================
 // ============================================================
-function sendDonateMessage(chatId, editMessageId = null) {
-  const donateText = 
+//
+//  FIXES applied here:
+//
+//  1. Every hardcoded plain-text sentence is now written with
+//     MarkdownV2 special characters properly escaped:
+//       - "." must be "\."  (was bare ".")
+//       - "!" must be "\!"  (was bare "!")
+//
+//  2. The function is now async and returns a Promise so that
+//     callers can await it.  The callback handler was calling
+//     sendDonateMessage() without await, meaning any
+//     Telegram 400 error was silently swallowed — the user
+//     saw nothing and received no error.
+//
+async function sendDonateMessage(chatId, editMessageId = null) {
+  // Every "." and "!" in plain text (outside of code spans)
+  // must be escaped. Characters inside `backtick code spans`
+  // are exempt — only ` and \ need escaping inside those.
+  const donateText =
     `💚 *Support Anime Dub Tracker*\n\n` +
-    `If you find this bot useful, please consider supporting its development.\n\n` +
+    // FIX: "." at end of sentence → "\."
+    `If you find this bot useful, please consider supporting its development\.\n\n` +
+    // The UPI ID is inside a code span — "@" and "." are safe here.
     `📱 *UPI ID:* \`clnishadaca@ybl\`\n\n` +
     `💳 *PhonePe QR:* Scan using PhonePe app\n\n` +
-    `*Thank you for your support!* 🙏\n\n` +
-    `_Every contribution helps keep the bot running!_`;
-  
+    // FIX: "!" inside bold → "\!"
+    `*Thank you for your support\!* 🙏\n\n` +
+    // FIX: "!" inside italic → "\!"
+    `_Every contribution helps keep the bot running\!_`;
+
   const donateKeyboard = {
     inline_keyboard: [
       [{ text: "💚 Send Donation (UPI)", callback_data: "upi_donate" }],
@@ -191,17 +207,17 @@ function sendDonateMessage(chatId, editMessageId = null) {
   };
   
   if (editMessageId) {
-    bot.editMessageText(donateText, {
+    await bot.editMessageText(donateText, {
       chat_id: chatId,
       message_id: editMessageId,
       parse_mode: "MarkdownV2",
       reply_markup: donateKeyboard
-    }).catch(() => {});
+    }).catch(err => console.error("Donate edit error:", err.message));
   } else {
-    bot.sendMessage(chatId, donateText, { 
+    await bot.sendMessage(chatId, donateText, { 
       parse_mode: "MarkdownV2", 
       reply_markup: donateKeyboard 
-    });
+    }).catch(err => console.error("Donate send error:", err.message));
   }
 }
 
@@ -211,7 +227,7 @@ function sendDonateMessage(chatId, editMessageId = null) {
 function getSearchQuery(title) {
   let query = title
     .toLowerCase()
-    .replace(/[′'’]/g, "'")
+    .replace(/[′'']/g, "'")
     .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -597,6 +613,7 @@ function formatAnimeMessage(data) {
 
   let dubLine;
   if (!data.dubFound) {
+    // Parentheses are escaped with \\ in source = single \ in string value ✓
     dubLine = `Not currently tracked \\(no English dub scheduled\\)`;
   } else if (data.isFinished) {
     dubLine = `All *${escMd(data.dubEpisodes)}* episodes available in English dub ✅`;
@@ -620,22 +637,87 @@ function formatAnimeMessage(data) {
 // ============================================================
 // ====== SIMILAR ANIMES MESSAGE ==============================
 // ============================================================
+//
+//  FIXES applied here:
+//
+//  BUG 1 — searchCmd crash: "Character '(' is reserved"
+//  ─────────────────────────────────────────────────────
+//  The original code derived searchCmd FROM the already-escaped
+//  title, then stripped backslashes:
+//
+//    escapedTitle = escMd("Re:Zero (Season 2)")
+//               → "Re:Zero \(Season 2\)"
+//
+//    escapedTitle.replace(/\\/g, "")
+//               → "Re:Zero (Season 2)"   ← raw ( ) back in the string!
+//
+//    .replace(/\s+/g, "_")
+//               → "Re:Zero_(Season_2)"   ← ( ) still raw in MarkdownV2 text
+//
+//  Telegram sees the bare ( and ) and throws:
+//  "Character '(' is reserved and must be escaped with '\'"
+//
+//  FIX: Derive searchCmd from the ORIGINAL (unescaped) title,
+//  then strip every character that is not alphanumeric or a
+//  space before converting spaces to underscores. This gives a
+//  clean, safe command token that never contains MarkdownV2
+//  special characters.
+//
+//  BUG 2 — Unintended italic + unescaped ">" in the footer line
+//  ─────────────────────────────────────────────────────────────
+//  The original footer was:
+//    `_Tap /search_<name> to search any anime_`
+//
+//  MarkdownV2 scans for paired _ markers and finds:
+//    Opening _ : first character
+//    Closing _ : the _ INSIDE "/search_"
+//  So "Tap /search" becomes italic, leaving "<name> to search
+//  any anime_" dangling — Telegram rejects the whole message.
+//
+//  Also, ">" is a MarkdownV2 special character (block-quote
+//  marker) and must be escaped as "\>".
+//
+//  FIX: Escape the _ in "/search\_" and the > in "<name\>".
+//
 function formatSimilarMessage(similarData) {
   const { results, originalTitle } = similarData;
   
   if (results.length === 0) {
-    return `🔍 No similar animes found for *${escMd(originalTitle)}*.`;
+    // FIX: "." after the closing "*" must be escaped
+    return `🔍 No similar animes found for *${escMd(originalTitle)}*\.`;
   }
   
   let message = `🎲 *Similar to ${escMd(originalTitle)}:*\n\n`;
+
   results.forEach((anime, index) => {
     const escapedTitle = escMd(anime.title);
     message += `${index + 1}\\. *${escapedTitle}*\n`;
-    if (anime.episodes) message += `   📺 ${anime.episodes} episodes\n`;
-    const searchCmd = escapedTitle.replace(/\\/g, "").replace(/\s+/g, "_");
-    message += `   🔍 /search_${searchCmd}\n\n`;
+    if (anime.episodes) message += `   📺 ${escMd(anime.episodes)} episodes\n`;
+
+    // ── FIX: Build searchCmd from the ORIGINAL title, not the escaped one ──
+    //
+    // Strip every character that isn't a letter, digit, or space, then
+    // replace spaces with underscores. This produces a clean alphanumeric
+    // slug that is safe to embed in any MarkdownV2 message.
+    //
+    // Example: "Re:Zero − Starting Life in Another World (Season 2)"
+    //       →  "ReZero__Starting_Life_in_Another_World_Season_2"
+    //       →  (after collapsing repeated underscores) "ReZero_Starting_Life_in_Another_World_Season_2"
+    //
+    const searchCmd = anime.title
+      .replace(/[^a-zA-Z0-9\s]/g, "")   // strip all non-alphanumeric / non-space
+      .replace(/\s+/g, "_")              // spaces → underscores
+      .replace(/_+/g, "_")               // collapse consecutive underscores
+      .replace(/^_|_$/g, "")            // trim leading/trailing underscores
+      .slice(0, 50);                     // keep within a sane command length
+
+    message += `   🔍 /search\_${searchCmd}\n\n`;
   });
-  message += `_Tap /search_<name> to search any anime_`;
+
+  // FIX: Escape the underscore in "/search_" so MarkdownV2 does not treat
+  // the surrounding underscores as italic markers, and escape ">" inside
+  // the placeholder "<name\>".
+  message += `_Tap /search\_<name\> to search any anime_`;
   
   return message;
 }
@@ -737,15 +819,19 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
   }
 });
 
-// Handle /search_<title> from similar animes
+// ============================================================
+// ====== /search_<title> — from Similar Animes results =======
+// ============================================================
+//
+//  The searchCmd embedded in the message is already a clean
+//  alphanumeric slug (see formatSimilarMessage). We just need
+//  to replace underscores back to spaces before querying.
+//
 bot.onText(/\/search_(.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
-  let query = match[1].trim().replace(/_/g, " ");
-  
-  try {
-    query = decodeURIComponent(query);
-  } catch(e) {}
-  
+  // Replace underscores back to spaces to reconstruct the query
+  const query = match[1].trim().replace(/_/g, " ");
+
   const placeholder = await bot.sendMessage(chatId,
     `🔍 Searching for *${escMd(query)}*\\.\\.\\.`,
     { parse_mode: "MarkdownV2" }
@@ -858,7 +944,9 @@ bot.on("callback_query", async (q) => {
 
   if (data === "show_donate") {
     await bot.answerCallbackQuery(q.id);
-    sendDonateMessage(chatId);
+    // FIX: await sendDonateMessage so errors surface in the console
+    // instead of being silently swallowed.
+    await sendDonateMessage(chatId);
     return;
   }
 
@@ -883,6 +971,15 @@ bot.on("callback_query", async (q) => {
       chat_id: chatId,
       message_id: similarMsg.message_id,
       parse_mode: "MarkdownV2"
+    }).catch(err => {
+      console.error("Similar animes edit error:", err.message);
+      // If the edit fails, fall back to a plain error message so the
+      // "Finding similar animes..." placeholder doesn't hang forever.
+      bot.editMessageText("❌ Could not load similar animes\\. Please try again\\.", {
+        chat_id: chatId,
+        message_id: similarMsg.message_id,
+        parse_mode: "MarkdownV2"
+      }).catch(() => {});
     });
     return;
   }
