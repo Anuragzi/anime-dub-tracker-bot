@@ -94,9 +94,19 @@ function normalizeText(text) {
 }
 
 // ============================================================
+// ====== CACHE FOR SIMILAR ANIMES ============================
+// ============================================================
+const similarCache = new Map();
+
+// ============================================================
 // ====== SIMILAR ANIMES FUNCTION =============================
 // ============================================================
-async function getSimilarAnimes(animeId, currentTitle) {
+async function getSimilarAnimes(animeId) {
+  // Check cache first
+  if (similarCache.has(animeId)) {
+    return similarCache.get(animeId);
+  }
+  
   try {
     // First fetch the current anime to get its genres
     const animeData = await axios.post(
@@ -105,8 +115,7 @@ async function getSimilarAnimes(animeId, currentTitle) {
         query: `query ($id: Int) {
           Media(id: $id, type: ANIME) {
             genres
-            season
-            format
+            title { english romaji }
           }
         }`,
         variables: { id: parseInt(animeId) },
@@ -115,6 +124,9 @@ async function getSimilarAnimes(animeId, currentTitle) {
     );
 
     const genres = animeData.data?.data?.Media?.genres || [];
+    const originalTitle = animeData.data?.data?.Media?.title?.english || 
+                          animeData.data?.data?.Media?.title?.romaji || 
+                          "Unknown";
     
     if (genres.length === 0) return [];
 
@@ -142,16 +154,21 @@ async function getSimilarAnimes(animeId, currentTitle) {
 
     const similarAnimes = similarRes.data?.data?.Page?.media || [];
     
-    // Return top 3, excluding the current anime
-    return similarAnimes.slice(0, 3).map(anime => ({
+    const results = similarAnimes.slice(0, 3).map(anime => ({
       id: anime.id,
       title: anime.title.english || anime.title.romaji || "Unknown",
       episodes: anime.episodes
     }));
     
+    // Store in cache for 1 hour
+    similarCache.set(animeId, { results, originalTitle });
+    setTimeout(() => similarCache.delete(animeId), 3600000);
+    
+    return { results, originalTitle };
+    
   } catch (err) {
     console.error("Similar animes error:", err.message);
-    return [];
+    return { results: [], originalTitle: "Unknown" };
   }
 }
 
@@ -220,8 +237,8 @@ function createStreamingKeyboard(animeTitle, animeId, trackCallbackData = null) 
     rows.push([{ text: "📌 Track this anime", callback_data: trackCallbackData }]);
   }
   
-  // Row 2: Similar Animes button
-  rows.push([{ text: "🎲 Similar Animes", callback_data: `similar_${animeId}_${encodeURIComponent(animeTitle)}` }]);
+  // Row 2: Similar Animes button (using only ID to avoid long callback data)
+  rows.push([{ text: "🎲 Similar Animes", callback_data: `similar_${animeId}` }]);
   
   // Row 3: Donate button
   rows.push([{ text: "💚 Support / Donate", callback_data: "show_donate" }]);
@@ -624,16 +641,18 @@ function formatAnimeMessage(data) {
 // ============================================================
 // ====== SIMILAR ANIMES MESSAGE ==============================
 // ============================================================
-function formatSimilarMessage(similarAnimes, originalTitle) {
-  if (similarAnimes.length === 0) {
+function formatSimilarMessage(similarData) {
+  const { results, originalTitle } = similarData;
+  
+  if (results.length === 0) {
     return `🔍 No similar animes found for *${escMd(originalTitle)}*.`;
   }
   
   let message = `🎲 *Similar to ${escMd(originalTitle)}:*\n\n`;
-  similarAnimes.forEach((anime, index) => {
+  results.forEach((anime, index) => {
     message += `${index + 1}\\. *${escMd(anime.title)}*\n`;
     if (anime.episodes) message += `   📺 ${anime.episodes} episodes\n`;
-    message += `   🔍 /search_${escMd(anime.title.replace(/\s/g, "_"))}\n\n`;
+    message += `   🔍 /search_${escMd(anime.title.replace(/\s+/g, "_"))}\n\n`;
   });
   message += `_Tap /search_<name> to search any anime_`;
   
@@ -877,14 +896,12 @@ bot.on("callback_query", async (q) => {
 
   if (data.startsWith("similar_")) {
     await bot.answerCallbackQuery(q.id);
-    const parts = data.split("_");
-    const animeId = parseInt(parts[1]);
-    const animeTitle = decodeURIComponent(parts.slice(2).join("_"));
+    const animeId = parseInt(data.split("_")[1]);
     
     const similarMsg = await bot.sendMessage(chatId, "🔍 Finding similar animes...");
     
-    const similarAnimes = await getSimilarAnimes(animeId, animeTitle);
-    const similarText = formatSimilarMessage(similarAnimes, animeTitle);
+    const similarData = await getSimilarAnimes(animeId);
+    const similarText = formatSimilarMessage(similarData);
     
     await bot.editMessageText(similarText, {
       chat_id: chatId,
