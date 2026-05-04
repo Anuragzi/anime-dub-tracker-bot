@@ -85,10 +85,13 @@ function cleanText(t) {
   if (!t) return "No synopsis available.";
   return t.replace(/<[^>]*>/g, "").trim().slice(0, 350);
 }
+
+// FIXED: Escape ALL special Telegram MarkdownV2 characters
 function escMd(t) {
   if (t == null) return "";
-  return String(t).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
+  return String(t).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
 }
+
 function normalizeText(text) {
   return (text || "").toString().toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 }
@@ -102,13 +105,11 @@ const similarCache = new Map();
 // ====== SIMILAR ANIMES FUNCTION =============================
 // ============================================================
 async function getSimilarAnimes(animeId) {
-  // Check cache first
   if (similarCache.has(animeId)) {
     return similarCache.get(animeId);
   }
   
   try {
-    // First fetch the current anime to get its genres
     const animeData = await axios.post(
       "https://graphql.anilist.co",
       {
@@ -128,9 +129,8 @@ async function getSimilarAnimes(animeId) {
                           animeData.data?.data?.Media?.title?.romaji || 
                           "Unknown";
     
-    if (genres.length === 0) return [];
+    if (genres.length === 0) return { results: [], originalTitle };
 
-    // Search for similar anime by genres
     const searchQuery = `query ($genres: [String], $excludeId: Int) {
       Page(page: 1, perPage: 6) {
         media(genre_in: $genres, type: ANIME, id_not: $excludeId, sort: POPULARITY_DESC) {
@@ -160,7 +160,6 @@ async function getSimilarAnimes(animeId) {
       episodes: anime.episodes
     }));
     
-    // Store in cache for 1 hour
     similarCache.set(animeId, { results, originalTitle });
     setTimeout(() => similarCache.delete(animeId), 3600000);
     
@@ -228,29 +227,18 @@ function getStreamingUrl(animeTitle) {
   return null;
 }
 
-// Create inline keyboard with Track, Similar, and Donate buttons
 function createStreamingKeyboard(animeTitle, animeId, trackCallbackData = null) {
   const rows = [];
-  
-  // Row 1: Track button
   if (trackCallbackData) {
     rows.push([{ text: "📌 Track this anime", callback_data: trackCallbackData }]);
   }
-  
-  // Row 2: Similar Animes button (using only ID to avoid long callback data)
   rows.push([{ text: "🎲 Similar Animes", callback_data: `similar_${animeId}` }]);
-  
-  // Row 3: Donate button
   rows.push([{ text: "💚 Support / Donate", callback_data: "show_donate" }]);
-  
   return { inline_keyboard: rows };
 }
 
-// Alert keyboard
 function createAlertKeyboard(animeTitle) {
-  const rows = [
-    [{ text: "❌ Close", callback_data: "close_alert" }]
-  ];
+  const rows = [[{ text: "❌ Close", callback_data: "close_alert" }]];
   return { inline_keyboard: rows };
 }
 
@@ -278,9 +266,6 @@ async function getAnimeBySearch(search) {
   }
 }
 
-// ============================================================
-// ====== ANILIST — FETCH BY ID ===============================
-// ============================================================
 async function getAnimeById(id) {
   try {
     const res = await axios.post(
@@ -360,9 +345,6 @@ async function getDubTimetable() {
   }
 }
 
-// ============================================================
-// ====== HELPER: Check if dubPremier is valid ================
-// ============================================================
 function hasValidDubPremier(entry) {
   if (!entry || !entry.dubPremier) return false;
   return entry.dubPremier !== "0001-01-01T00:00:00Z";
@@ -396,7 +378,6 @@ async function getDubFromUpdatesCollection(anilistId, title) {
 // ====== MASTER DUB LOOKUP ===================================
 // ============================================================
 async function getDubCount(anilistId, fallbackTitle) {
-  // STEP 1: Check dubCache
   try {
     const cacheDoc = await db.collection("dubCache").doc(String(anilistId)).get();
     
@@ -418,7 +399,6 @@ async function getDubCount(anilistId, fallbackTitle) {
     console.log(`[DubCount] Cache check failed for ${fallbackTitle}:`, err.message);
   }
   
-  // STEP 2: Check dub_updates
   try {
     const updatesData = await getDubFromUpdatesCollection(anilistId, fallbackTitle);
     
@@ -453,7 +433,6 @@ async function getDubCount(anilistId, fallbackTitle) {
     console.log(`[DubCount] dub_updates check failed for ${fallbackTitle}:`, err.message);
   }
   
-  // STEP 3: Fall back to API
   if (!process.env.ANIMESCHEDULE_KEY) return null;
 
   const entry = await getAnimeScheduleEntry(anilistId);
@@ -650,9 +629,11 @@ function formatSimilarMessage(similarData) {
   
   let message = `🎲 *Similar to ${escMd(originalTitle)}:*\n\n`;
   results.forEach((anime, index) => {
-    message += `${index + 1}\\. *${escMd(anime.title)}*\n`;
+    const escapedTitle = escMd(anime.title);
+    message += `${index + 1}\\. *${escapedTitle}*\n`;
     if (anime.episodes) message += `   📺 ${anime.episodes} episodes\n`;
-    message += `   🔍 /search_${escMd(anime.title.replace(/\s+/g, "_"))}\n\n`;
+    const searchCmd = escapedTitle.replace(/\\/g, "").replace(/\s+/g, "_");
+    message += `   🔍 /search_${searchCmd}\n\n`;
   });
   message += `_Tap /search_<name> to search any anime_`;
   
@@ -703,12 +684,11 @@ bot.onText(/\/help/, (msg) =>
   })
 );
 
-// ====== DONATE COMMAND HANDLER ======
 bot.onText(/\/donate/, (msg) => {
   sendDonateMessage(msg.chat.id);
 });
 
-/// ============================================================
+// ============================================================
 // ====== /search - WITH FORCE REPLY ==========================
 // ============================================================
 
@@ -761,6 +741,10 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
 bot.onText(/\/search_(.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   let query = match[1].trim().replace(/_/g, " ");
+  
+  try {
+    query = decodeURIComponent(query);
+  } catch(e) {}
   
   const placeholder = await bot.sendMessage(chatId,
     `🔍 Searching for *${escMd(query)}*\\.\\.\\.`,
@@ -864,15 +848,7 @@ bot.on("callback_query", async (q) => {
   const userId = q.from.id;
   const data = q.data;
 
-  if (data === "close_alert") {
-    await bot.answerCallbackQuery(q.id, { text: "Closed" });
-    try {
-      await bot.deleteMessage(chatId, q.message.message_id);
-    } catch (_) {}
-    return;
-  }
-
-  if (data === "close_donate") {
+  if (data === "close_alert" || data === "close_donate") {
     await bot.answerCallbackQuery(q.id, { text: "Closed" });
     try {
       await bot.deleteMessage(chatId, q.message.message_id);
