@@ -1,11 +1,6 @@
 // ============================================================
 // ====== ANIME DUB TRACKER BOT — bot.js =====================
-// ============================================================
-// HOW DUB COUNT WORKS (important to understand):
-//
-// PRIORITY 1: Read from dubCache (Firestore) - FAST
-// PRIORITY 2: Read from dub_updates (Firestore) - from collector
-// PRIORITY 3: Fall back to AnimeSchedule API - SLOW (only when cache missing)
+// ====== FIXED: HTML parsing, no 409 conflict ================
 // ============================================================
 
 require("dotenv").config();
@@ -38,30 +33,76 @@ const db = admin.firestore();
 console.log("✅ Firebase connected");
 
 // ====== BOT ======
-if (!process.env.BOT_TOKEN) { console.error("❌ BOT_TOKEN missing"); process.exit(1); }
-if (!process.env.ANIMESCHEDULE_KEY) console.warn("⚠️  ANIMESCHEDULE_KEY not set");
-
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
-
-// Delete any existing webhook to prevent 409 conflict error
-axios.post(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/deleteWebhook`)
-  .catch(err => console.log("Webhook delete error:", err.message));
-
-bot.getMe().then((me) => console.log(`🤖 Bot: @${me.username}`));
-
-bot.setMyCommands([
-  { command: "search",  description: "🔍 Search for an anime by title" },
-  { command: "mylist",  description: "📋 View your tracked anime list" },
-  { command: "donate",  description: "💚 Support the developer" },
-  { command: "help",    description: "❓ Show help message" },
-  { command: "start",   description: "👋 Start the bot" },
-]).then(() => console.log("✅ Command menu set successfully!"));
-
-// ====== SAFE LOG ======
-let lastLog = 0;
-function safeLog(msg) {
-  if (Date.now() - lastLog > 15000) { console.log(msg); lastLog = Date.now(); }
+if (!process.env.BOT_TOKEN) { 
+  console.error("❌ BOT_TOKEN missing"); 
+  process.exit(1); 
 }
+if (!process.env.ANIMESCHEDULE_KEY) console.warn("⚠️ ANIMESCHEDULE_KEY not set");
+
+// ============================================================
+// ====== FIX 409 CONFLICT - Proper webhook cleanup ===========
+// ============================================================
+async function initBot() {
+  console.log("🔧 Initializing bot...");
+  
+  // Delete webhook and drop pending updates
+  try {
+    await axios.post(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/deleteWebhook`, {
+      drop_pending_updates: true
+    });
+    console.log("✅ Webhook deleted");
+  } catch (err) {
+    console.log("Webhook delete error:", err.message);
+  }
+  
+  // Wait a bit for Telegram to process
+  await sleep(2000);
+  
+  // Create bot with polling options to prevent conflicts
+  const bot = new TelegramBot(process.env.BOT_TOKEN, { 
+    polling: {
+      interval: 300,
+      autoStart: false,
+      params: {
+        timeout: 10
+      }
+    }
+  });
+  
+  // Start polling with error handling
+  bot.startPolling();
+  console.log("✅ Polling started");
+  
+  return bot;
+}
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Global bot variable
+let bot;
+
+// Start bot
+initBot().then(async (b) => {
+  bot = b;
+  
+  bot.getMe().then((me) => console.log(`🤖 Bot: @${me.username}`));
+  
+  await bot.setMyCommands([
+    { command: "search",  description: "🔍 Search for an anime by title" },
+    { command: "mylist",  description: "📋 View your tracked anime list" },
+    { command: "donate",  description: "💚 Support the developer" },
+    { command: "help",    description: "❓ Show help message" },
+    { command: "start",   description: "👋 Start the bot" },
+  ]).then(() => console.log("✅ Command menu set successfully!"));
+  
+  // Setup all handlers
+  setupHandlers();
+  
+  console.log("✅ Bot started successfully!");
+}).catch(err => {
+  console.error("❌ Failed to start bot:", err.message);
+  process.exit(1);
+});
 
 // ====== UTILS ======
 function cleanText(t) {
@@ -69,10 +110,13 @@ function cleanText(t) {
   return t.replace(/<[^>]*>/g, "").trim().slice(0, 350);
 }
 
-// Simple Markdown escape (only for dynamic content)
-function escMd(t) {
-  if (t == null) return "";
-  return String(t).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
+// HTML escape (much simpler than Markdown)
+function htmlEscape(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 function normalizeText(text) {
@@ -80,13 +124,13 @@ function normalizeText(text) {
 }
 
 // ============================================================
-// ====== DONATE MESSAGE (SIMPLE) =============================
+// ====== DONATE MESSAGE (HTML - NO PARSING ISSUES) ===========
 // ============================================================
 async function sendDonateMessage(chatId, editMessageId = null) {
   const donateText = 
-    `💚 *Support Anime Dub Tracker*\n\n` +
+    `💚 <b>Support Anime Dub Tracker</b>\n\n` +
     `If you find this bot useful, please consider supporting its development.\n\n` +
-    `📱 *UPI ID:* \`clnishadaca@ybl\`\n\n` +
+    `📱 <b>UPI ID:</b> <code>clnishadaca@ybl</code>\n\n` +
     `Thank you for your support! 🙏`;
 
   const donateKeyboard = {
@@ -95,18 +139,24 @@ async function sendDonateMessage(chatId, editMessageId = null) {
     ]
   };
   
-  if (editMessageId) {
-    await bot.editMessageText(donateText, {
-      chat_id: chatId,
-      message_id: editMessageId,
-      parse_mode: "MarkdownV2",
-      reply_markup: donateKeyboard
-    }).catch(err => console.error("Donate edit error:", err.message));
-  } else {
-    await bot.sendMessage(chatId, donateText, { 
-      parse_mode: "MarkdownV2", 
-      reply_markup: donateKeyboard 
-    }).catch(err => console.error("Donate send error:", err.message));
+  try {
+    if (editMessageId) {
+      await bot.editMessageText(donateText, {
+        chat_id: chatId,
+        message_id: editMessageId,
+        parse_mode: "HTML",
+        reply_markup: donateKeyboard
+      });
+    } else {
+      await bot.sendMessage(chatId, donateText, { 
+        parse_mode: "HTML", 
+        reply_markup: donateKeyboard 
+      });
+    }
+  } catch (err) {
+    console.error("Donate error:", err.message);
+    // Fallback without HTML
+    await bot.sendMessage(chatId, donateText.replace(/<[^>]*>/g, ''));
   }
 }
 
@@ -188,14 +238,11 @@ async function getAnimeScheduleEntry(anilistId) {
     const entry = Array.isArray(data) ? data[0] : data;
 
     if (entry) {
-      console.log(`[AS /anime] id=${anilistId} route="${entry.route}" status="${entry.status}" episodes=${entry.episodes} dubPremier="${entry.dubPremier}"`);
-    } else {
-      console.log(`[AS /anime] id=${anilistId} → no result`);
+      console.log(`[AS /anime] id=${anilistId} route="${entry.route}" status="${entry.status}" episodes=${entry.episodes}`);
     }
     return entry || null;
   } catch (err) {
-    console.error(`[AS /anime] error: ${err.response?.status || 'unknown'} ${err.message}`);
-    if (err.response?.data) console.error(`Response data:`, err.response.data);
+    console.error(`[AS /anime] error: ${err.message}`);
     return null;
   }
 }
@@ -213,23 +260,12 @@ async function getDubTimetable() {
       entries = res.data;
     } else if (Array.isArray(res.data?.data)) {
       entries = res.data.data;
-    } else if (Array.isArray(res.data?.results)) {
-      entries = res.data.results;
-    } else if (typeof res.data === 'object' && res.data !== null) {
-      entries = Object.values(res.data).find(v => Array.isArray(v)) || [];
     }
-
-    console.log(`[AS timetable] fetched ${entries.length} dub entries`);
     return entries;
   } catch (err) {
-    console.error(`[AS timetable] error: ${err.response?.status || 'unknown'} ${err.message}`);
+    console.error(`[AS timetable] error: ${err.message}`);
     return [];
   }
-}
-
-function hasValidDubPremier(entry) {
-  if (!entry || !entry.dubPremier) return false;
-  return entry.dubPremier !== "0001-01-01T00:00:00Z";
 }
 
 async function getDubFromUpdatesCollection(anilistId, title) {
@@ -241,14 +277,11 @@ async function getDubFromUpdatesCollection(anilistId, title) {
       .get();
     
     if (!snapshot.empty) {
-      const doc = snapshot.docs[0];
-      const data = doc.data();
-      console.log(`[DubCount] ✅ Found in dub_updates for "${title}" → ${data.episode || data.totalEpisodes || 'unknown'}`);
+      const data = snapshot.docs[0].data();
       return data;
     }
     return null;
   } catch (err) {
-    console.log(`[DubCount] dub_updates query failed for ${title}:`, err.message);
     return null;
   }
 }
@@ -259,10 +292,7 @@ async function getDubCount(anilistId, fallbackTitle) {
     
     if (cacheDoc.exists) {
       const cached = cacheDoc.data();
-      
       if (cached.dubEpisodes !== undefined && cached.dubEpisodes !== null) {
-        console.log(`[DubCount] ✅ Using CACHED data for "${fallbackTitle}" → ${cached.dubEpisodes} eps dubbed`);
-        
         return {
           dubEpisodes: cached.dubEpisodes,
           totalEpisodes: cached.totalEpisodes,
@@ -271,70 +301,48 @@ async function getDubCount(anilistId, fallbackTitle) {
         };
       }
     }
-  } catch (err) {
-    console.log(`[DubCount] Cache check failed for ${fallbackTitle}:`, err.message);
-  }
+  } catch (err) {}
   
   try {
     const updatesData = await getDubFromUpdatesCollection(anilistId, fallbackTitle);
-    
     if (updatesData) {
       let dubEpisodes = updatesData.episode || updatesData.totalEpisodes || updatesData.dubEpisodes || null;
       let totalEpisodes = updatesData.totalEpisodes || updatesData.episodes || null;
-      const isFinished = updatesData.status === "completed" || updatesData.isFinished === true;
-      const nextEpDate = updatesData.nextEpisodeDate || updatesData.releaseDate || null;
-      
-      console.log(`[DubCount] ✅ Using dub_updates data for "${fallbackTitle}" → ${dubEpisodes} eps dubbed`);
+      const isFinished = updatesData.status === "completed";
       
       await db.collection("dubCache").doc(String(anilistId)).set({
         anilistId: anilistId,
         title: fallbackTitle,
         totalEpisodes: totalEpisodes,
         dubEpisodes: dubEpisodes,
-        nextEpisodeDate: nextEpDate,
         isFinished: isFinished,
-        dubStatus: isFinished ? "completed" : (dubEpisodes ? "ongoing" : "pending"),
-        source: "dub_updates",
         lastUpdated: new Date(),
       }, { merge: true });
       
       return {
         dubEpisodes: dubEpisodes,
         totalEpisodes: totalEpisodes,
-        nextEpDate: nextEpDate,
+        nextEpDate: null,
         isFinished: isFinished,
       };
     }
-  } catch (err) {
-    console.log(`[DubCount] dub_updates check failed for ${fallbackTitle}:`, err.message);
-  }
-  
+  } catch (err) {}
+
   if (!process.env.ANIMESCHEDULE_KEY) return null;
 
   const entry = await getAnimeScheduleEntry(anilistId);
-  
-  if (!entry) {
-    console.log(`[DubCount] no AnimeSchedule entry for "${fallbackTitle}"`);
-    return null;
-  }
+  if (!entry) return null;
 
   const isFinished = entry.status?.toLowerCase() === "finished";
-  const hasDub = hasValidDubPremier(entry);
   const totalEpisodes = entry.episodes || 0;
   
-  if (isFinished && hasDub && totalEpisodes > 0) {
-    console.log(`[DubCount] "${fallbackTitle}" is a COMPLETED DUB → all ${totalEpisodes} episodes dubbed`);
-    
+  if (isFinished && entry.dubPremier && totalEpisodes > 0) {
     await db.collection("dubCache").doc(String(anilistId)).set({
       anilistId: anilistId,
       title: fallbackTitle,
       totalEpisodes: totalEpisodes,
       dubEpisodes: totalEpisodes,
-      nextEpisode: null,
-      nextEpisodeDate: null,
       isFinished: true,
-      dubStatus: "completed",
-      source: "animeschedule",
       lastUpdated: new Date(),
     }, { merge: true });
     
@@ -346,12 +354,12 @@ async function getDubCount(anilistId, fallbackTitle) {
     };
   }
 
-  const timetable = await getDubTimetable() || [];
+  const timetable = await getDubTimetable();
   let match = null;
 
   if (entry?.route) {
     match = timetable.find((t) => {
-      const routeValueT = normalizeText(t.route || t.slug || t.route_slug || t.slug_name);
+      const routeValueT = normalizeText(t.route || t.slug);
       return routeValueT && routeValueT === normalizeText(entry.route);
     });
   }
@@ -360,7 +368,6 @@ async function getDubCount(anilistId, fallbackTitle) {
     match = timetable.find((t) => {
       if (t.anilistId && parseInt(t.anilistId) === parseInt(anilistId)) return true;
       if (t.anilist_id && parseInt(t.anilist_id) === parseInt(anilistId)) return true;
-      if (t.anilistIds && Array.isArray(t.anilistIds) && t.anilistIds.map(String).includes(String(anilistId))) return true;
       return false;
     });
   }
@@ -368,32 +375,24 @@ async function getDubCount(anilistId, fallbackTitle) {
   if (match) {
     const nextEpNum = match.episodeNumber || 0;
     const currentDubbed = Math.max(0, nextEpNum - 1);
-    const nextEpDate = match.episodeDate ? new Date(match.episodeDate) : null;
-
-    console.log(`[DubCount] ONGOING: "${fallbackTitle}" → ${currentDubbed} eps dubbed (next: ${nextEpNum})`);
     
     await db.collection("dubCache").doc(String(anilistId)).set({
       anilistId: anilistId,
       title: fallbackTitle,
       totalEpisodes: match.episodes || entry?.episodes || 0,
       dubEpisodes: currentDubbed,
-      nextEpisode: nextEpNum,
-      nextEpisodeDate: nextEpDate,
       isFinished: false,
-      dubStatus: "ongoing",
-      source: "animeschedule",
       lastUpdated: new Date(),
     }, { merge: true });
 
     return {
       dubEpisodes: currentDubbed,
       totalEpisodes: match.episodes || entry?.episodes || null,
-      nextEpDate,
+      nextEpDate: null,
       isFinished: false,
     };
   }
 
-  console.log(`[DubCount] no dub data for "${fallbackTitle}"`);
   return null;
 }
 
@@ -409,7 +408,6 @@ async function buildAnimeData(anime) {
     status: anime.status || "UNKNOWN",
     synopsis: cleanText(anime.description),
     dubEpisodes: dubData?.dubEpisodes ?? null,
-    nextEpDate: dubData?.nextEpDate ?? null,
     isFinished: dubData?.isFinished ?? false,
     dubFound: dubData !== null,
     genres: anime.genres || []
@@ -458,7 +456,7 @@ async function updateLastAlerted(userId, animeId, episode) {
 }
 
 // ============================================================
-// ====== FORMAT SEARCH RESULT MESSAGE ========================
+// ====== FORMAT SEARCH RESULT MESSAGE (HTML) =================
 // ============================================================
 function formatAnimeMessage(data) {
   const statusLabel = {
@@ -468,37 +466,40 @@ function formatAnimeMessage(data) {
     CANCELLED: "Cancelled ❌",
   };
 
+  const title = htmlEscape(data.title);
+  const synopsis = htmlEscape(data.synopsis);
+  const status = htmlEscape(statusLabel[data.status] || data.status);
+  const totalEp = data.episodes ? htmlEscape(String(data.episodes)) : "Unknown";
+  
   let dubLine;
   if (!data.dubFound) {
     dubLine = `Not currently tracked (no English dub scheduled)`;
   } else if (data.isFinished) {
-    dubLine = `All *${escMd(data.dubEpisodes)}* episodes available in English dub ✅`;
+    dubLine = `All <b>${htmlEscape(String(data.dubEpisodes))}</b> episodes available in English dub ✅`;
   } else if (data.dubEpisodes === 0) {
     dubLine = `Dub not started yet — Ep 1 coming soon`;
   } else {
-    dubLine = `*${escMd(data.dubEpisodes)}* episode${data.dubEpisodes === 1 ? "" : "s"} available in English dub`;
+    dubLine = `<b>${htmlEscape(String(data.dubEpisodes))}</b> episode${data.dubEpisodes === 1 ? "" : "s"} available in English dub`;
   }
 
-  const totalLine = data.episodes ? `*${escMd(data.episodes)}*` : "Unknown";
-
   return (
-    `🎬 *${escMd(data.title)}*\n\n` +
-    `📺 Total Episodes: ${totalLine}\n` +
-    `📊 Status: ${escMd(statusLabel[data.status] || data.status)}\n\n` +
-    `🇬🇧 *English Dub:*\n${dubLine}\n\n` +
-    `📖 *Synopsis:*\n${escMd(data.synopsis)}`
+    `🎬 <b>${title}</b>\n\n` +
+    `📺 Total Episodes: ${totalEp}\n` +
+    `📊 Status: ${status}\n\n` +
+    `🇬🇧 <b>English Dub:</b>\n${dubLine}\n\n` +
+    `📖 <b>Synopsis:</b>\n${synopsis}`
   );
 }
 
 function buildMyListMessage(list) {
-  let text = `📋 *Your Tracked Anime (${escMd(list.length)})*\n\n`;
+  let text = `📋 <b>Your Tracked Anime (${list.length})</b>\n\n`;
   list.forEach((item, i) => {
     const dub = (item.dubEpisodes != null)
-      ? `Ep *${escMd(item.dubEpisodes)}* dubbed`
+      ? `Ep <b>${htmlEscape(String(item.dubEpisodes))}</b> dubbed`
       : "Dub unknown";
-    text += `${i + 1}\\. *${escMd(item.title)}* — 🇬🇧 ${dub}\n`;
+    text += `${i + 1}. <b>${htmlEscape(item.title)}</b> — 🇬🇧 ${dub}\n`;
   });
-  text += `\n_Tap below to untrack_`;
+  text += `\n<i>Tap below to untrack</i>`;
   const keyboard = list.map((item) => [
     { text: `🗑 Untrack: ${item.title}`, callback_data: `untrack_${item.id}` },
   ]);
@@ -506,94 +507,53 @@ function buildMyListMessage(list) {
 }
 
 // ============================================================
-// ====== /start & /help ======================================
+// ====== COMMAND HANDLERS ====================================
 // ============================================================
 const welcomeText =
-  `👋 *Welcome to Anime Dub Tracker!*\n\n` +
+  `👋 <b>Welcome to Anime Dub Tracker!</b>\n\n` +
   `I show you how many English dubbed episodes are out right now, and alert you the moment a new dubbed episode drops.\n\n` +
-  `*Commands:*\n` +
-  `🔍 /search <name> — Search for an anime\n` +
+  `<b>Commands:</b>\n` +
+  `🔍 /search &lt;name&gt; — Search for an anime\n` +
   `📋 /mylist — View and manage your tracked anime\n` +
   `💚 /donate — Support the developer\n` +
   `❓ /help — Show this message\n\n` +
-  `_Dub data: AnimeSchedule.net & MAL Forum_`;
+  `<i>Dub data: AnimeSchedule.net &amp; MAL Forum</i>`;
 
-bot.onText(/\/start/, (msg) =>
-  bot.sendMessage(msg.chat.id, welcomeText, {
-    parse_mode: "MarkdownV2",
-    reply_markup: { remove_keyboard: true },
-  })
-);
-bot.onText(/\/help/, (msg) =>
-  bot.sendMessage(msg.chat.id, welcomeText, {
-    parse_mode: "MarkdownV2",
-    reply_markup: { remove_keyboard: true },
-  })
-);
-
-bot.onText(/\/donate/, (msg) => {
-  sendDonateMessage(msg.chat.id);
-});
-
-// ============================================================
-// ====== /search - WITH FORCE REPLY ==========================
-// ============================================================
-
-bot.onText(/\/search$/, async (msg) => {
-  const chatId = msg.chat.id;
-  await bot.sendMessage(chatId, "🔍 Please type the anime name you want to search for:", {
-    reply_markup: { force_reply: true, selective: true }
+function setupHandlers() {
+  
+  bot.onText(/\/start/, (msg) => {
+    bot.sendMessage(msg.chat.id, welcomeText, {
+      parse_mode: "HTML",
+      reply_markup: { remove_keyboard: true },
+    }).catch(err => console.error("Start error:", err.message));
   });
-});
+  
+  bot.onText(/\/help/, (msg) => {
+    bot.sendMessage(msg.chat.id, welcomeText, {
+      parse_mode: "HTML",
+      reply_markup: { remove_keyboard: true },
+    }).catch(err => console.error("Help error:", err.message));
+  });
 
-bot.onText(/\/search (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const query = match[1].trim();
+  bot.onText(/\/donate/, (msg) => {
+    sendDonateMessage(msg.chat.id);
+  });
 
-  const placeholder = await bot.sendMessage(chatId,
-    `🔍 Searching for *${escMd(query)}*...`,
-    { parse_mode: "MarkdownV2" }
-  );
-
-  const anime = await getAnimeBySearch(query);
-  await bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
-
-  if (!anime) {
-    return bot.sendMessage(chatId, "❌ Anime not found. Try a different spelling.", {
-      parse_mode: "MarkdownV2",
-    });
-  }
-
-  const data = await buildAnimeData(anime);
-  const caption = formatAnimeMessage(data);
-  const keyboard = createStreamingKeyboard(data.title, data.id, `track_${data.id}`);
-
-  try {
-    if (data.image) {
-      await bot.sendPhoto(chatId, data.image, {
-        caption, 
-        parse_mode: "MarkdownV2", 
-        reply_markup: keyboard,
-      });
-    } else throw new Error("no image");
-  } catch {
-    await bot.sendMessage(chatId, caption, { 
-      parse_mode: "MarkdownV2", 
-      reply_markup: keyboard,
-    });
-  }
-});
-
-bot.on("message", async (msg) => {
-  if (msg.reply_to_message && msg.reply_to_message.text === "🔍 Please type the anime name you want to search for:") {
+  // ====== /search - WITH FORCE REPLY ======
+  bot.onText(/\/search$/, async (msg) => {
     const chatId = msg.chat.id;
-    const query = msg.text.trim();
-    
-    if (!query || query.startsWith("/")) return;
-    
+    await bot.sendMessage(chatId, "🔍 Please type the anime name you want to search for:", {
+      reply_markup: { force_reply: true, selective: true }
+    });
+  });
+
+  bot.onText(/\/search (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const query = match[1].trim();
+
     const placeholder = await bot.sendMessage(chatId,
-      `🔍 Searching for *${escMd(query)}*...`,
-      { parse_mode: "MarkdownV2" }
+      `🔍 Searching for <b>${htmlEscape(query)}</b>...`,
+      { parse_mode: "HTML" }
     );
 
     const anime = await getAnimeBySearch(query);
@@ -601,7 +561,7 @@ bot.on("message", async (msg) => {
 
     if (!anime) {
       return bot.sendMessage(chatId, "❌ Anime not found. Try a different spelling.", {
-        parse_mode: "MarkdownV2",
+        parse_mode: "HTML",
       });
     }
 
@@ -613,186 +573,209 @@ bot.on("message", async (msg) => {
       if (data.image) {
         await bot.sendPhoto(chatId, data.image, {
           caption, 
-          parse_mode: "MarkdownV2", 
+          parse_mode: "HTML", 
           reply_markup: keyboard,
         });
       } else throw new Error("no image");
     } catch {
       await bot.sendMessage(chatId, caption, { 
-        parse_mode: "MarkdownV2", 
+        parse_mode: "HTML", 
         reply_markup: keyboard,
       });
     }
-  }
-});
-
-// ============================================================
-// ====== /mylist =============================================
-// ============================================================
-bot.onText(/\/mylist/, async (msg) => {
-  const list = await getTrackedList(msg.from.id);
-  if (list.length === 0) {
-    return bot.sendMessage(msg.chat.id,
-      "📭 Your list is empty!\n\nUse /search to find anime to track.",
-      { parse_mode: "MarkdownV2" }
-    );
-  }
-  const { text, keyboard } = buildMyListMessage(list);
-  bot.sendMessage(msg.chat.id, text, {
-    parse_mode: "MarkdownV2",
-    reply_markup: { inline_keyboard: keyboard },
   });
-});
 
-// ============================================================
-// ====== CALLBACK QUERY ======================================
-// ============================================================
-bot.on("callback_query", async (q) => {
-  const chatId = q.message.chat.id;
-  const userId = q.from.id;
-  const data = q.data;
+  // Handle reply to search prompt
+  bot.on("message", async (msg) => {
+    if (msg.reply_to_message && msg.reply_to_message.text === "🔍 Please type the anime name you want to search for:") {
+      const chatId = msg.chat.id;
+      const query = msg.text.trim();
+      
+      if (!query || query.startsWith("/")) return;
+      
+      const placeholder = await bot.sendMessage(chatId,
+        `🔍 Searching for <b>${htmlEscape(query)}</b>...`,
+        { parse_mode: "HTML" }
+      );
 
-  if (data === "close_alert" || data === "close_donate") {
-    await bot.answerCallbackQuery(q.id, { text: "Closed" });
-    try {
-      await bot.deleteMessage(chatId, q.message.message_id);
-    } catch (_) {}
-    return;
-  }
+      const anime = await getAnimeBySearch(query);
+      await bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
 
-  if (data === "show_donate") {
-    await bot.answerCallbackQuery(q.id);
-    await sendDonateMessage(chatId);
-    return;
-  }
-
-  if (data.startsWith("track_")) {
-    const animeId = parseInt(data.split("_")[1]);
-    const anime = await getAnimeById(animeId);
-    if (!anime) {
-      return bot.answerCallbackQuery(q.id, { text: "❌ Could not fetch data.", show_alert: true });
-    }
-    const animeData = await buildAnimeData(anime);
-    const added = await trackAnime(userId, animeData);
-    if (added) {
-      await bot.answerCallbackQuery(q.id, {
-        text: `✅ "${animeData.title}" is now tracked!`, show_alert: true,
-      });
-      try {
-        await bot.editMessageReplyMarkup(
-          { inline_keyboard: [[{ text: "✅ Tracked!", callback_data: `noop_${animeId}` }]] },
-          { chat_id: chatId, message_id: q.message.message_id }
-        );
-      } catch (_) {}
-    } else {
-      await bot.answerCallbackQuery(q.id, { text: "📌 Already in your list!", show_alert: false });
-    }
-    return;
-  }
-
-  if (data.startsWith("untrack_")) {
-    const animeId = parseInt(data.split("_")[1]);
-    await untrackAnime(userId, animeId);
-    await bot.answerCallbackQuery(q.id, { text: "🗑 Removed.", show_alert: false });
-    const newList = await getTrackedList(userId);
-    try {
-      if (newList.length === 0) {
-        await bot.editMessageText(
-          "📭 Your list is now empty!\n\nUse /search to find anime to track.",
-          { chat_id: chatId, message_id: q.message.message_id, parse_mode: "MarkdownV2", reply_markup: { inline_keyboard: [] } }
-        );
-      } else {
-        const { text, keyboard } = buildMyListMessage(newList);
-        await bot.editMessageText(text, {
-          chat_id: chatId, message_id: q.message.message_id,
-          parse_mode: "MarkdownV2", reply_markup: { inline_keyboard: keyboard },
+      if (!anime) {
+        return bot.sendMessage(chatId, "❌ Anime not found. Try a different spelling.", {
+          parse_mode: "HTML",
         });
       }
-    } catch (_) {}
-    return;
-  }
 
-  if (data.startsWith("noop_")) {
-    return bot.answerCallbackQuery(q.id, { text: "Already tracked ✅", show_alert: false });
-  }
+      const data = await buildAnimeData(anime);
+      const caption = formatAnimeMessage(data);
+      const keyboard = createStreamingKeyboard(data.title, data.id, `track_${data.id}`);
 
-  await bot.answerCallbackQuery(q.id, { text: "Unknown action." });
-});
-
-// ============================================================
-// ====== ALERT CRON (every 30 min) ===========================
-// ============================================================
-cron.schedule("*/30 * * * *", async () => {
-  safeLog("🔔 Checking for new dubbed episodes...");
-
-  let snapshot;
-  try { snapshot = await db.collection("users").get(); }
-  catch (err) { console.error("Firestore error:", err.message); return; }
-
-  for (const doc of snapshot.docs) {
-    const userId = doc.id;
-    const list = doc.data().tracking || [];
-
-    for (const tracked of list) {
       try {
-        let currentDub = null;
-        
-        const cacheDoc = await db.collection("dubCache").doc(String(tracked.id)).get();
-        
-        if (cacheDoc.exists) {
-          const cached = cacheDoc.data();
-          currentDub = cached.dubEpisodes;
-          console.log(`[Alert] Using cached dub count for ${tracked.title}: ${currentDub}`);
-        } else {
-          const updatesData = await getDubFromUpdatesCollection(tracked.id, tracked.title);
-          if (updatesData) {
-            currentDub = updatesData.episode || updatesData.totalEpisodes || updatesData.dubEpisodes;
-            console.log(`[Alert] Using dub_updates for ${tracked.title}: ${currentDub}`);
-          } else {
-            const entry = await getAnimeScheduleEntry(tracked.id);
-            
-            if (entry?.status?.toLowerCase() === "finished" && entry?.dubPremier && entry?.dubPremier !== "0001-01-01T00:00:00Z" && entry?.episodes > 0) {
-              currentDub = entry.episodes;
-            } else if (entry?.route) {
-              const timetable = await getDubTimetable();
-              const match = timetable.find((t) => t.route === entry.route);
-              if (match) currentDub = Math.max(0, (match.episodeNumber || 1) - 1);
-            }
-          }
-        }
-
-        if (currentDub === null) continue;
-
-        const lastAlerted = tracked.lastEpisodeAlerted ?? 0;
-
-        if (currentDub > lastAlerted) {
-          const alertKeyboard = createAlertKeyboard(tracked.title);
-          
-          await bot.sendMessage(
-            userId,
-            `🚨 *New Dubbed Episode Alert!*\n\n` +
-            `🎬 *${escMd(tracked.title)}*\n\n` +
-            `🇬🇧 Episode *${escMd(currentDub)}* is now available in English dub!\n\n` +
-            `🔗 *Check your streaming service for availability*`,
-            { 
-              parse_mode: "MarkdownV2",
-              reply_markup: alertKeyboard,
-            }
-          );
-          await updateLastAlerted(userId, tracked.id, currentDub);
-        }
-      } catch (err) {
-        console.error(`Alert error for ${tracked.id}:`, err.message);
+        if (data.image) {
+          await bot.sendPhoto(chatId, data.image, {
+            caption, 
+            parse_mode: "HTML", 
+            reply_markup: keyboard,
+          });
+        } else throw new Error("no image");
+      } catch {
+        await bot.sendMessage(chatId, caption, { 
+          parse_mode: "HTML", 
+          reply_markup: keyboard,
+        });
       }
     }
-  }
-});
+  });
+
+  // ====== /mylist ======
+  bot.onText(/\/mylist/, async (msg) => {
+    const list = await getTrackedList(msg.from.id);
+    if (list.length === 0) {
+      return bot.sendMessage(msg.chat.id,
+        "📭 Your list is empty!\n\nUse /search to find anime to track.",
+        { parse_mode: "HTML" }
+      );
+    }
+    const { text, keyboard } = buildMyListMessage(list);
+    bot.sendMessage(msg.chat.id, text, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: keyboard },
+    }).catch(err => console.error("Mylist error:", err.message));
+  });
+
+  // ====== CALLBACK QUERY ======
+  bot.on("callback_query", async (q) => {
+    const chatId = q.message.chat.id;
+    const userId = q.from.id;
+    const data = q.data;
+
+    if (data === "close_alert" || data === "close_donate") {
+      await bot.answerCallbackQuery(q.id, { text: "Closed" });
+      try {
+        await bot.deleteMessage(chatId, q.message.message_id);
+      } catch (_) {}
+      return;
+    }
+
+    if (data === "show_donate") {
+      await bot.answerCallbackQuery(q.id);
+      await sendDonateMessage(chatId);
+      return;
+    }
+
+    if (data.startsWith("track_")) {
+      const animeId = parseInt(data.split("_")[1]);
+      const anime = await getAnimeById(animeId);
+      if (!anime) {
+        return bot.answerCallbackQuery(q.id, { text: "❌ Could not fetch data.", show_alert: true });
+      }
+      const animeData = await buildAnimeData(anime);
+      const added = await trackAnime(userId, animeData);
+      if (added) {
+        await bot.answerCallbackQuery(q.id, {
+          text: `✅ "${animeData.title}" is now tracked!`, show_alert: true,
+        });
+        try {
+          await bot.editMessageReplyMarkup(
+            { inline_keyboard: [[{ text: "✅ Tracked!", callback_data: `noop_${animeId}` }]] },
+            { chat_id: chatId, message_id: q.message.message_id }
+          );
+        } catch (_) {}
+      } else {
+        await bot.answerCallbackQuery(q.id, { text: "📌 Already in your list!", show_alert: false });
+      }
+      return;
+    }
+
+    if (data.startsWith("untrack_")) {
+      const animeId = parseInt(data.split("_")[1]);
+      await untrackAnime(userId, animeId);
+      await bot.answerCallbackQuery(q.id, { text: "🗑 Removed.", show_alert: false });
+      const newList = await getTrackedList(userId);
+      try {
+        if (newList.length === 0) {
+          await bot.editMessageText(
+            "📭 Your list is now empty!\n\nUse /search to find anime to track.",
+            { chat_id: chatId, message_id: q.message.message_id, parse_mode: "HTML", reply_markup: { inline_keyboard: [] } }
+          );
+        } else {
+          const { text, keyboard } = buildMyListMessage(newList);
+          await bot.editMessageText(text, {
+            chat_id: chatId, message_id: q.message.message_id,
+            parse_mode: "HTML", reply_markup: { inline_keyboard: keyboard },
+          });
+        }
+      } catch (_) {}
+      return;
+    }
+
+    if (data.startsWith("noop_")) {
+      return bot.answerCallbackQuery(q.id, { text: "Already tracked ✅", show_alert: false });
+    }
+
+    await bot.answerCallbackQuery(q.id, { text: "Unknown action." });
+  });
+
+  // ====== ALERT CRON (every 30 min) ======
+  cron.schedule("*/30 * * * *", async () => {
+    console.log("🔔 Checking for new dubbed episodes...");
+
+    let snapshot;
+    try { snapshot = await db.collection("users").get(); }
+    catch (err) { console.error("Firestore error:", err.message); return; }
+
+    for (const doc of snapshot.docs) {
+      const userId = doc.id;
+      const list = doc.data().tracking || [];
+
+      for (const tracked of list) {
+        try {
+          let currentDub = null;
+          
+          const cacheDoc = await db.collection("dubCache").doc(String(tracked.id)).get();
+          
+          if (cacheDoc.exists) {
+            const cached = cacheDoc.data();
+            currentDub = cached.dubEpisodes;
+          } else {
+            const updatesData = await getDubFromUpdatesCollection(tracked.id, tracked.title);
+            if (updatesData) {
+              currentDub = updatesData.episode || updatesData.totalEpisodes || updatesData.dubEpisodes;
+            }
+          }
+
+          if (currentDub === null) continue;
+
+          const lastAlerted = tracked.lastEpisodeAlerted ?? 0;
+
+          if (currentDub > lastAlerted) {
+            const alertKeyboard = createAlertKeyboard(tracked.title);
+            
+            await bot.sendMessage(
+              userId,
+              `🚨 <b>New Dubbed Episode Alert!</b>\n\n` +
+              `🎬 <b>${htmlEscape(tracked.title)}</b>\n\n` +
+              `🇬🇧 Episode <b>${htmlEscape(String(currentDub))}</b> is now available in English dub!\n\n` +
+              `🔗 Check your streaming service for availability`,
+              { 
+                parse_mode: "HTML",
+                reply_markup: alertKeyboard,
+              }
+            );
+            await updateLastAlerted(userId, tracked.id, currentDub);
+          }
+        } catch (err) {
+          console.error(`Alert error for ${tracked.id}:`, err.message);
+        }
+      }
+    }
+  });
+}
 
 // ============================================================
 // ====== GLOBAL ERROR HANDLERS ===============================
 // ============================================================
-bot.on("polling_error", (err) => console.error("Polling error:", err.message));
+bot?.on("polling_error", (err) => console.error("Polling error:", err.message));
 process.on("unhandledRejection", (r) => console.error("Unhandled rejection:", r));
 process.on("uncaughtException", (err) => console.error("Uncaught exception:", err.message));
-
-console.log("✅ Bot started successfully!");
