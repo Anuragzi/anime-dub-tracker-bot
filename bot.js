@@ -69,9 +69,7 @@ function cleanText(t) {
   return t.replace(/<[^>]*>/g, "").trim().slice(0, 350);
 }
 
-// ============================================================
-// ====== escMd — Escape ALL Telegram MarkdownV2 special chars
-// ============================================================
+// Simple Markdown escape (only for dynamic content)
 function escMd(t) {
   if (t == null) return "";
   return String(t).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
@@ -82,95 +80,17 @@ function normalizeText(text) {
 }
 
 // ============================================================
-// ====== CACHE FOR SIMILAR ANIMES ============================
-// ============================================================
-const similarCache = new Map();
-
-// ============================================================
-// ====== SIMILAR ANIMES FUNCTION =============================
-// ============================================================
-async function getSimilarAnimes(animeId) {
-  if (similarCache.has(animeId)) {
-    return similarCache.get(animeId);
-  }
-  
-  try {
-    const animeData = await axios.post(
-      "https://graphql.anilist.co",
-      {
-        query: `query ($id: Int) {
-          Media(id: $id, type: ANIME) {
-            genres
-            title { english romaji }
-          }
-        }`,
-        variables: { id: parseInt(animeId) },
-      },
-      { timeout: 10000 }
-    );
-
-    const genres = animeData.data?.data?.Media?.genres || [];
-    const originalTitle = animeData.data?.data?.Media?.title?.english || 
-                          animeData.data?.data?.Media?.title?.romaji || 
-                          "Unknown";
-    
-    if (genres.length === 0) return { results: [], originalTitle };
-
-    const searchQuery = `query ($genres: [String], $excludeId: Int) {
-      Page(page: 1, perPage: 6) {
-        media(genre_in: $genres, type: ANIME, id_not: $excludeId, sort: POPULARITY_DESC) {
-          id
-          title { english romaji }
-          episodes
-          coverImage { large }
-        }
-      }
-    }`;
-
-    const similarRes = await axios.post(
-      "https://graphql.anilist.co",
-      {
-        query: searchQuery,
-        variables: { genres: genres, excludeId: parseInt(animeId) },
-      },
-      { timeout: 10000 }
-    );
-
-    const similarAnimes = similarRes.data?.data?.Page?.media || [];
-    
-    const results = similarAnimes.slice(0, 3).map(anime => ({
-      id: anime.id,
-      title: anime.title.english || anime.title.romaji || "Unknown",
-      episodes: anime.episodes
-    }));
-    
-    similarCache.set(animeId, { results, originalTitle });
-    setTimeout(() => similarCache.delete(animeId), 3600000);
-    
-    return { results, originalTitle };
-    
-  } catch (err) {
-    console.error("Similar animes error:", err.message);
-    return { results: [], originalTitle: "Unknown" };
-  }
-}
-
-// ============================================================
-// ====== DONATE MESSAGE ======================================
+// ====== DONATE MESSAGE (SIMPLE) =============================
 // ============================================================
 async function sendDonateMessage(chatId, editMessageId = null) {
-  // FIXED: Double backslashes for proper escaping (\\\\. = single \. in final string)
-  const donateText =
+  const donateText = 
     `💚 *Support Anime Dub Tracker*\n\n` +
-    `If you find this bot useful, please consider supporting its development\\\\\\.\n\n` +
+    `If you find this bot useful, please consider supporting its development.\n\n` +
     `📱 *UPI ID:* \`clnishadaca@ybl\`\n\n` +
-    `💳 *PhonePe QR:* Scan using PhonePe app\n\n` +
-    `*Thank you for your support\\\\!* 🙏\n\n` +
-    `_Every contribution helps keep the bot running\\\\\!_`;
+    `Thank you for your support! 🙏`;
 
   const donateKeyboard = {
     inline_keyboard: [
-      [{ text: "💚 Send Donation (UPI)", callback_data: "upi_donate" }],
       [{ text: "❌ Close", callback_data: "close_donate" }]
     ]
   };
@@ -191,34 +111,14 @@ async function sendDonateMessage(chatId, editMessageId = null) {
 }
 
 // ============================================================
-// ====== STREAMING SITE HELPERS ==============================
+// ====== KEYBOARD (NO SIMILAR ANIMES) ========================
 // ============================================================
-function getSearchQuery(title) {
-  let query = title
-    .toLowerCase()
-    .replace(/[′'']/g, "'")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  
-  return {
-    hyphen: query.replace(/ /g, "-"),
-    plus: query.replace(/ /g, "+"),
-    encoded: encodeURIComponent(query),
-  };
-}
-
-function getStreamingUrl(animeTitle) {
-  return null;
-}
-
 function createStreamingKeyboard(animeTitle, animeId, trackCallbackData = null) {
   const rows = [];
   if (trackCallbackData) {
     rows.push([{ text: "📌 Track this anime", callback_data: trackCallbackData }]);
   }
-  rows.push([{ text: "🎲 Similar Animes", callback_data: `similar_${animeId}` }]);
-  rows.push([{ text: "💚 Support / Donate", callback_data: "show_donate" }]);
+  rows.push([{ text: "💚 Donate", callback_data: "show_donate" }]);
   return { inline_keyboard: rows };
 }
 
@@ -273,7 +173,7 @@ async function getAnimeById(id) {
 }
 
 // ============================================================
-// ====== ANIMESCHEDULE — STEP 1: Get show route by AniList ID
+// ====== ANIMESCHEDULE API ===================================
 // ============================================================
 async function getAnimeScheduleEntry(anilistId) {
   if (!process.env.ANIMESCHEDULE_KEY) return null;
@@ -300,9 +200,6 @@ async function getAnimeScheduleEntry(anilistId) {
   }
 }
 
-// ============================================================
-// ====== ANIMESCHEDULE — STEP 2: Get current dub timetable ===
-// ============================================================
 async function getDubTimetable() {
   if (!process.env.ANIMESCHEDULE_KEY) return [];
   try {
@@ -335,9 +232,6 @@ function hasValidDubPremier(entry) {
   return entry.dubPremier !== "0001-01-01T00:00:00Z";
 }
 
-// ============================================================
-// ====== GET DUB FROM DUB_UPDATES COLLECTION =================
-// ============================================================
 async function getDubFromUpdatesCollection(anilistId, title) {
   try {
     const normalizedTitle = title.toLowerCase();
@@ -359,9 +253,6 @@ async function getDubFromUpdatesCollection(anilistId, title) {
   }
 }
 
-// ============================================================
-// ====== MASTER DUB LOOKUP ===================================
-// ============================================================
 async function getDubCount(anilistId, fallbackTitle) {
   try {
     const cacheDoc = await db.collection("dubCache").doc(String(anilistId)).get();
@@ -506,9 +397,6 @@ async function getDubCount(anilistId, fallbackTitle) {
   return null;
 }
 
-// ============================================================
-// ====== BUILD FULL ANIME OBJECT =============================
-// ============================================================
 async function buildAnimeData(anime) {
   const title = anime.title.english || anime.title.romaji;
   const dubData = await getDubCount(anime.id, title);
@@ -582,7 +470,7 @@ function formatAnimeMessage(data) {
 
   let dubLine;
   if (!data.dubFound) {
-    dubLine = `Not currently tracked \\(no English dub scheduled\\)`;
+    dubLine = `Not currently tracked (no English dub scheduled)`;
   } else if (data.isFinished) {
     dubLine = `All *${escMd(data.dubEpisodes)}* episodes available in English dub ✅`;
   } else if (data.dubEpisodes === 0) {
@@ -602,42 +490,8 @@ function formatAnimeMessage(data) {
   );
 }
 
-// ============================================================
-// ====== SIMILAR ANIMES MESSAGE ==============================
-// ============================================================
-function formatSimilarMessage(similarData) {
-  const { results, originalTitle } = similarData;
-  
-  if (results.length === 0) {
-    return `🔍 No similar animes found for *${escMd(originalTitle)}*\\.`;
-  }
-  
-  let message = `🎲 *Similar to ${escMd(originalTitle)}:*\n\n`;
-
-  results.forEach((anime, index) => {
-    const escapedTitle = escMd(anime.title);
-    message += `${index + 1}\\. ${escapedTitle}\n`;
-    if (anime.episodes) message += `   📺 ${anime.episodes} episodes\n`;
-
-    // FIXED: Double backslash for underscore escaping
-    const searchCmd = anime.title
-      .replace(/[^a-zA-Z0-9\s]/g, "")
-      .replace(/\s+/g, "_")
-      .slice(0, 40);
-    message += `   🔍 /search\\_${searchCmd}\n\n`;
-  });
-
-  // FIXED: Double backslashes for underscore and greater-than escaping
-  message += `_Tap /search\\_<name\\> to search any anime_`;
-  
-  return message;
-}
-
-// ============================================================
-// ====== /mylist MESSAGE BUILDER =============================
-// ============================================================
 function buildMyListMessage(list) {
-  let text = `📋 *Your Tracked Anime \\(${escMd(list.length)}\\):*\n\n`;
+  let text = `📋 *Your Tracked Anime (${escMd(list.length)})*\n\n`;
   list.forEach((item, i) => {
     const dub = (item.dubEpisodes != null)
       ? `Ep *${escMd(item.dubEpisodes)}* dubbed`
@@ -655,14 +509,14 @@ function buildMyListMessage(list) {
 // ====== /start & /help ======================================
 // ============================================================
 const welcomeText =
-  `👋 *Welcome to Anime Dub Tracker\\!*\n\n` +
-  `I show you how many English dubbed episodes are out right now, and alert you the moment a new dubbed episode drops\\.\n\n` +
+  `👋 *Welcome to Anime Dub Tracker!*\n\n` +
+  `I show you how many English dubbed episodes are out right now, and alert you the moment a new dubbed episode drops.\n\n` +
   `*Commands:*\n` +
-  `🔍 /search \\<name\\> — Search for an anime\n` +
+  `🔍 /search <name> — Search for an anime\n` +
   `📋 /mylist — View and manage your tracked anime\n` +
   `💚 /donate — Support the developer\n` +
   `❓ /help — Show this message\n\n` +
-  `_Dub data: AnimeSchedule\\.net & MAL Forum_`;
+  `_Dub data: AnimeSchedule.net & MAL Forum_`;
 
 bot.onText(/\/start/, (msg) =>
   bot.sendMessage(msg.chat.id, welcomeText, {
@@ -697,7 +551,7 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
   const query = match[1].trim();
 
   const placeholder = await bot.sendMessage(chatId,
-    `🔍 Searching for *${escMd(query)}*\\.\\.\\.`,
+    `🔍 Searching for *${escMd(query)}*...`,
     { parse_mode: "MarkdownV2" }
   );
 
@@ -705,48 +559,7 @@ bot.onText(/\/search (.+)/, async (msg, match) => {
   await bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
 
   if (!anime) {
-    return bot.sendMessage(chatId, "❌ Anime not found\\. Try a different spelling\\.", {
-      parse_mode: "MarkdownV2",
-    });
-  }
-
-  const data = await buildAnimeData(anime);
-  const caption = formatAnimeMessage(data);
-  const keyboard = createStreamingKeyboard(data.title, data.id, `track_${data.id}`);
-
-  try {
-    if (data.image) {
-      await bot.sendPhoto(chatId, data.image, {
-        caption, 
-        parse_mode: "MarkdownV2", 
-        reply_markup: keyboard,
-      });
-    } else throw new Error("no image");
-  } catch {
-    await bot.sendMessage(chatId, caption, { 
-      parse_mode: "MarkdownV2", 
-      reply_markup: keyboard,
-    });
-  }
-});
-
-// ============================================================
-// ====== /search_<title> — from Similar Animes results =======
-// ============================================================
-bot.onText(/\/search_(.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const query = match[1].trim().replace(/_/g, " ");
-
-  const placeholder = await bot.sendMessage(chatId,
-    `🔍 Searching for *${escMd(query)}*\\.\\.\\.`,
-    { parse_mode: "MarkdownV2" }
-  );
-
-  const anime = await getAnimeBySearch(query);
-  await bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
-
-  if (!anime) {
-    return bot.sendMessage(chatId, "❌ Anime not found\\. Try a different spelling\\.", {
+    return bot.sendMessage(chatId, "❌ Anime not found. Try a different spelling.", {
       parse_mode: "MarkdownV2",
     });
   }
@@ -779,7 +592,7 @@ bot.on("message", async (msg) => {
     if (!query || query.startsWith("/")) return;
     
     const placeholder = await bot.sendMessage(chatId,
-      `🔍 Searching for *${escMd(query)}*\\.\\.\\.`,
+      `🔍 Searching for *${escMd(query)}*...`,
       { parse_mode: "MarkdownV2" }
     );
 
@@ -787,7 +600,7 @@ bot.on("message", async (msg) => {
     await bot.deleteMessage(chatId, placeholder.message_id).catch(() => {});
 
     if (!anime) {
-      return bot.sendMessage(chatId, "❌ Anime not found\\. Try a different spelling\\.", {
+      return bot.sendMessage(chatId, "❌ Anime not found. Try a different spelling.", {
         parse_mode: "MarkdownV2",
       });
     }
@@ -820,7 +633,7 @@ bot.onText(/\/mylist/, async (msg) => {
   const list = await getTrackedList(msg.from.id);
   if (list.length === 0) {
     return bot.sendMessage(msg.chat.id,
-      "📭 *Your list is empty\\!*\n\nUse /search to find anime to track\\.",
+      "📭 Your list is empty!\n\nUse /search to find anime to track.",
       { parse_mode: "MarkdownV2" }
     );
   }
@@ -850,38 +663,6 @@ bot.on("callback_query", async (q) => {
   if (data === "show_donate") {
     await bot.answerCallbackQuery(q.id);
     await sendDonateMessage(chatId);
-    return;
-  }
-
-  if (data === "upi_donate") {
-    await bot.answerCallbackQuery(q.id, { 
-      text: "UPI ID: clnishadaca@ybl\nOpen PhonePe/Google Pay and send donation.",
-      show_alert: true 
-    });
-    return;
-  }
-
-  if (data.startsWith("similar_")) {
-    await bot.answerCallbackQuery(q.id);
-    const animeId = parseInt(data.split("_")[1]);
-    
-    const similarMsg = await bot.sendMessage(chatId, "🔍 Finding similar animes...");
-    
-    const similarData = await getSimilarAnimes(animeId);
-    const similarText = formatSimilarMessage(similarData);
-    
-    await bot.editMessageText(similarText, {
-      chat_id: chatId,
-      message_id: similarMsg.message_id,
-      parse_mode: "MarkdownV2"
-    }).catch(err => {
-      console.error("Similar animes edit error:", err.message);
-      bot.editMessageText("❌ Could not load similar animes\\. Please try again\\.", {
-        chat_id: chatId,
-        message_id: similarMsg.message_id,
-        parse_mode: "MarkdownV2"
-      }).catch(() => {});
-    });
     return;
   }
 
@@ -917,7 +698,7 @@ bot.on("callback_query", async (q) => {
     try {
       if (newList.length === 0) {
         await bot.editMessageText(
-          "📭 *Your list is now empty\\!*\n\nUse /search to find anime to track\\.",
+          "📭 Your list is now empty!\n\nUse /search to find anime to track.",
           { chat_id: chatId, message_id: q.message.message_id, parse_mode: "MarkdownV2", reply_markup: { inline_keyboard: [] } }
         );
       } else {
@@ -989,9 +770,9 @@ cron.schedule("*/30 * * * *", async () => {
           
           await bot.sendMessage(
             userId,
-            `🚨 *New Dubbed Episode Alert\\!*\n\n` +
+            `🚨 *New Dubbed Episode Alert!*\n\n` +
             `🎬 *${escMd(tracked.title)}*\n\n` +
-            `🇬🇧 Episode *${escMd(currentDub)}* is now available in English dub\\!\n\n` +
+            `🇬🇧 Episode *${escMd(currentDub)}* is now available in English dub!\n\n` +
             `🔗 *Check your streaming service for availability*`,
             { 
               parse_mode: "MarkdownV2",
