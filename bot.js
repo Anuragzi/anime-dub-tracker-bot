@@ -1,6 +1,6 @@
 // ============================================================
 // ====== ANIME DUB TRACKER BOT — bot.js =====================
-// ====== FIXED: HTML parsing, no 409 conflict ================
+// ====== FIXED: HTML parsing, streaming buttons, title matching
 // ============================================================
 
 require("dotenv").config();
@@ -45,7 +45,6 @@ if (!process.env.ANIMESCHEDULE_KEY) console.warn("⚠️ ANIMESCHEDULE_KEY not s
 async function initBot() {
   console.log("🔧 Initializing bot...");
   
-  // Delete webhook and drop pending updates
   try {
     await axios.post(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/deleteWebhook`, {
       drop_pending_updates: true
@@ -55,10 +54,8 @@ async function initBot() {
     console.log("Webhook delete error:", err.message);
   }
   
-  // Wait a bit for Telegram to process
   await sleep(2000);
   
-  // Create bot with polling options to prevent conflicts
   const bot = new TelegramBot(process.env.BOT_TOKEN, { 
     polling: {
       interval: 300,
@@ -69,7 +66,6 @@ async function initBot() {
     }
   });
   
-  // Start polling with error handling
   bot.startPolling();
   console.log("✅ Polling started");
   
@@ -78,10 +74,8 @@ async function initBot() {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Global bot variable
 let bot;
 
-// Start bot
 initBot().then(async (b) => {
   bot = b;
   
@@ -95,7 +89,6 @@ initBot().then(async (b) => {
     { command: "start",   description: "👋 Start the bot" },
   ]).then(() => console.log("✅ Command menu set successfully!"));
   
-  // Setup all handlers
   setupHandlers();
   
   console.log("✅ Bot started successfully!");
@@ -110,7 +103,6 @@ function cleanText(t) {
   return t.replace(/<[^>]*>/g, "").trim().slice(0, 350);
 }
 
-// HTML escape (much simpler than Markdown)
 function htmlEscape(text) {
   if (!text) return "";
   return String(text)
@@ -123,8 +115,19 @@ function normalizeText(text) {
   return (text || "").toString().toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 }
 
+// ====== STREAMING SITES (for buttons) ======
+function getStreamingSites(animeTitle) {
+  const encodedTitle = encodeURIComponent(animeTitle);
+  return [
+    { name: "kayoanime.com", url: `https://kayoanime.com/?s=${encodedTitle}` },
+    { name: "animetoki.com", url: `https://animetoki.com/?s=${encodedTitle}` },
+    { name: "anikoto.cz", url: `https://anikoto.cz/?s=${encodedTitle}` },
+    { name: "animove.com", url: `https://animove.com/?s=${encodedTitle}` }
+  ];
+}
+
 // ============================================================
-// ====== DONATE MESSAGE (HTML - NO PARSING ISSUES) ===========
+// ====== DONATE MESSAGE ======================================
 // ============================================================
 async function sendDonateMessage(chatId, editMessageId = null) {
   const donateText = 
@@ -155,20 +158,35 @@ async function sendDonateMessage(chatId, editMessageId = null) {
     }
   } catch (err) {
     console.error("Donate error:", err.message);
-    // Fallback without HTML
     await bot.sendMessage(chatId, donateText.replace(/<[^>]*>/g, ''));
   }
 }
 
 // ============================================================
-// ====== KEYBOARD (NO SIMILAR ANIMES) ========================
+// ====== KEYBOARD WITH STREAMING BUTTONS =====================
 // ============================================================
 function createStreamingKeyboard(animeTitle, animeId, trackCallbackData = null) {
   const rows = [];
+  
+  // Track button
   if (trackCallbackData) {
     rows.push([{ text: "📌 Track this anime", callback_data: trackCallbackData }]);
   }
+  
+  // Streaming sites row (4 buttons in 2 rows of 2)
+  const sites = getStreamingSites(animeTitle);
+  rows.push([
+    { text: "🎬 kayoanime.com", url: sites[0].url },
+    { text: "🎬 animetoki.com", url: sites[1].url }
+  ]);
+  rows.push([
+    { text: "🎬 anikoto.cz", url: sites[2].url },
+    { text: "🎬 animove.com", url: sites[3].url }
+  ]);
+  
+  // Donate button
   rows.push([{ text: "💚 Donate", callback_data: "show_donate" }]);
+  
   return { inline_keyboard: rows };
 }
 
@@ -178,7 +196,7 @@ function createAlertKeyboard(animeTitle) {
 }
 
 // ============================================================
-// ====== ANILIST — SEARCH BY NAME ============================
+// ====== ANILIST API =========================================
 // ============================================================
 async function getAnimeBySearch(search) {
   try {
@@ -236,13 +254,8 @@ async function getAnimeScheduleEntry(anilistId) {
 
     const data = res.data?.data || res.data || [];
     const entry = Array.isArray(data) ? data[0] : data;
-
-    if (entry) {
-      console.log(`[AS /anime] id=${anilistId} route="${entry.route}" status="${entry.status}" episodes=${entry.episodes}`);
-    }
     return entry || null;
   } catch (err) {
-    console.error(`[AS /anime] error: ${err.message}`);
     return null;
   }
 }
@@ -263,25 +276,62 @@ async function getDubTimetable() {
     }
     return entries;
   } catch (err) {
-    console.error(`[AS timetable] error: ${err.message}`);
     return [];
   }
 }
 
+// ====== IMPROVED: Partial title matching for dub_updates ======
 async function getDubFromUpdatesCollection(anilistId, title) {
   try {
     const normalizedTitle = title.toLowerCase();
-    const snapshot = await db.collection("dub_updates")
+    
+    // First try exact match
+    let snapshot = await db.collection("dub_updates")
       .where("normalizedTitle", "==", normalizedTitle)
       .limit(1)
       .get();
     
-    if (!snapshot.empty) {
+    // If exact match fails, try partial match
+    if (snapshot.empty) {
+      console.log(`[DubCount] No exact match for "${title}", trying partial match...`);
+      
+      const allDocs = await db.collection("dub_updates").get();
+      let bestMatch = null;
+      let bestScore = 0;
+      
+      for (const doc of allDocs.docs) {
+        const data = doc.data();
+        const docTitle = data.title.toLowerCase();
+        
+        const titleWords = normalizedTitle.split(' ').filter(w => w.length > 3);
+        const docWords = docTitle.split(' ').filter(w => w.length > 3);
+        
+        let matchCount = 0;
+        for (const word of titleWords) {
+          if (docTitle.includes(word)) matchCount++;
+        }
+        
+        const score = matchCount / Math.max(titleWords.length, 1);
+        
+        if (score > 0.5 && score > bestScore) {
+          bestScore = score;
+          bestMatch = data;
+        }
+      }
+      
+      if (bestMatch) {
+        console.log(`[DubCount] Partial match found: "${bestMatch.title}" → ${bestMatch.episode} eps`);
+        return bestMatch;
+      }
+    } else {
       const data = snapshot.docs[0].data();
+      console.log(`[DubCount] ✅ Found in dub_updates for "${title}" → ${data.episode || 'unknown'}`);
       return data;
     }
+    
     return null;
   } catch (err) {
+    console.log(`[DubCount] dub_updates query failed for ${title}:`, err.message);
     return null;
   }
 }
@@ -539,7 +589,6 @@ function setupHandlers() {
     sendDonateMessage(msg.chat.id);
   });
 
-  // ====== /search - WITH FORCE REPLY ======
   bot.onText(/\/search$/, async (msg) => {
     const chatId = msg.chat.id;
     await bot.sendMessage(chatId, "🔍 Please type the anime name you want to search for:", {
@@ -585,7 +634,6 @@ function setupHandlers() {
     }
   });
 
-  // Handle reply to search prompt
   bot.on("message", async (msg) => {
     if (msg.reply_to_message && msg.reply_to_message.text === "🔍 Please type the anime name you want to search for:") {
       const chatId = msg.chat.id;
@@ -628,7 +676,6 @@ function setupHandlers() {
     }
   });
 
-  // ====== /mylist ======
   bot.onText(/\/mylist/, async (msg) => {
     const list = await getTrackedList(msg.from.id);
     if (list.length === 0) {
@@ -644,7 +691,6 @@ function setupHandlers() {
     }).catch(err => console.error("Mylist error:", err.message));
   });
 
-  // ====== CALLBACK QUERY ======
   bot.on("callback_query", async (q) => {
     const chatId = q.message.chat.id;
     const userId = q.from.id;
@@ -773,9 +819,6 @@ function setupHandlers() {
   });
 }
 
-// ============================================================
-// ====== GLOBAL ERROR HANDLERS ===============================
-// ============================================================
 bot?.on("polling_error", (err) => console.error("Polling error:", err.message));
 process.on("unhandledRejection", (r) => console.error("Unhandled rejection:", r));
 process.on("uncaughtException", (err) => console.error("Uncaught exception:", err.message));
