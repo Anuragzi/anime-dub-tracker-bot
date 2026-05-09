@@ -122,7 +122,7 @@ function getStreamingSites(animeTitle) {
     { name: "kayoanime.com", url: `https://kayoanime.com/?s=${encodedTitle}` },
     { name: "animetoki.com", url: `https://animetoki.com/?s=${encodedTitle}` },
     { name: "anikoto.cz", url: `https://anikoto.cz/?s=${encodedTitle}` },
-    { name: "animove.com", url: `https://animove.com/?s=${encodedTitle}` }
+    { name: "animoye.com", url: `https://animoye.com/?s=${encodedTitle}` }
   ];
 }
 
@@ -181,7 +181,7 @@ function createStreamingKeyboard(animeTitle, animeId, trackCallbackData = null) 
   ]);
   rows.push([
     { text: "🎬 anikoto.cz", url: sites[2].url },
-    { text: "🎬 animove.com", url: sites[3].url }
+    { text: "🎬 animoye.com", url: sites[3].url }
   ]);
   
   // Donate button
